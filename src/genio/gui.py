@@ -1399,10 +1399,13 @@ class MainScene(Scene):
                         sprite.add_popup(f"shield {effect.delta_shield}", 7)
                         sprite.add_animation("anims.debuff")
                     case SinglePointEffectType.STATUS:
-                        status_effect, counter = effect.add_status
-                        if not isinstance(status_effect, StatusDefinition):
-                            raise ValueError("Status effect not valid")
-                        sprite.add_popup(f"+ {status_effect.name}", 7)
+                        if effect.add_status:
+                            status_effect, _counter = effect.add_status
+                            if not isinstance(status_effect, StatusDefinition):
+                                raise ValueError("Status effect not valid")
+                            sprite.add_popup(f"+ {status_effect.name}", 7)
+                        elif effect.remove_status:
+                            sprite.add_popup(f"- {effect.remove_status}", 7)
                         sprite.add_animation("anims.debuff")
 
     def sprite_by_id(self, id: str) -> WrappedImage:

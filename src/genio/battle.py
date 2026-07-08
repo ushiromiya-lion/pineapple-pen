@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 import uuid
-import weakref
 from collections import Counter, deque
 from collections.abc import Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import cache, cached_property
 from heapq import heappop, heappush
 from itertools import chain
@@ -24,27 +23,48 @@ from typing_extensions import (
 )
 
 from genio.artifacts import parse_stylize
+from genio.battle_commands import (
+    ApplyStatus,
+    BattleCommand,
+    DealDamage,
+    GainBlock,
+    Heal,
+    commands_from_effect,
+    effect_from_command,
+)
 from genio.card import Card
 from genio.components import CanAddAnim
 from genio.core.base import access, promptly
 from genio.effect import (
+    Advisory,
     CreateCardEffect,
+    DealDamageToSelf,
     DestroyCardEffect,
     DestroyRuleEffect,
     DiscardCardsEffect,
     DrawCardsEffect,
     DuplicateCardEffect,
+    GainBlockReaction,
     GlobalEffect,
+    HealSelf,
+    ModifyAmount,
+    OnBlockGained,
+    OnDamageDealt,
+    OnDamageTaken,
+    OnTurnEnd,
+    OnTurnStart,
     SinglePointEffect,
     SinglePointEffectType,
     StatusDefinition,
     TransformCardEffect,
+    UnsafeStatusExpression,
+    evaluate_status_condition,
+    evaluate_status_expr,
     parse_effect,
 )
 from genio.gears.card_printer import CardPrinter
 from genio.gears.sentence_embed import Corpus
 from genio.predef import access_predef, predef
-from genio.subst import Subst
 
 logger = get_logger()
 
@@ -659,22 +679,7 @@ class StatusEffect:
     counter: int
     owner: Battler
 
-    _subst: Subst = field(init=False)
-
     description: str = ""
-
-    def __post_init__(self):
-        self._subst = self.defn.subst.replace("me", self.owner.name_stem)
-
-    def apply(self, results: str) -> str:
-        if self.is_expired():
-            return results
-        matches, modified = self._subst.apply(
-            results, {"counter": self.counter}, allow_zero_matches=True
-        )
-        if self.counter_type == "times":
-            self.counter -= matches
-        return modified
 
     @property
     def counter_type(self) -> Literal["turns", "times"]:
@@ -692,16 +697,29 @@ class StatusEffect:
         return self.counter <= 0
 
     def _describe_myself(self) -> None:
-        subst = self.defn.subst.show()
-        name = self.defn.name
-        interpreted = _interpret_status_effect(name, subst)
-        self.description = interpreted.interpretation
+        self.description = self._default_description()
 
     def describe_myself(self) -> str:
         # TODO: cache this and also for consistency keep only one way of getting description
         if not self.description:
-            executor.submit(self._describe_myself)
+            self._describe_myself()
         return self.description
+
+    def _default_description(self) -> str:
+        reaction = self.defn.reaction
+        match reaction:
+            case ModifyAmount(expr=expr, condition=condition):
+                suffix = f" when {condition}" if condition else ""
+                return f"modifies amount to {expr}{suffix}."
+            case DealDamageToSelf(amount=amount):
+                return f"takes {amount} damage at {self.defn.trigger}."
+            case HealSelf(amount=amount):
+                return f"heals {amount} at {self.defn.trigger}."
+            case GainBlockReaction(amount=amount):
+                return f"gains {amount} block at {self.defn.trigger}."
+            case Advisory(description=description):
+                return description
+        return "has an effect."
 
 
 T = TypeVar("T")
@@ -794,7 +812,6 @@ def calculate_total_cost(cards: list[Card]) -> int:
 
 class BattleBundle:
     effects: SortedList[tuple[Battler | None, SinglePointEffect | GlobalEffect]]
-    postprocessors: list[weakref.WeakMethod]
     proposed_cards: list[Card]
     player_artifacts: list[Artifact]
     rules: list[str | None]
@@ -814,7 +831,6 @@ class BattleBundle:
         self.battle_prelude = battle_prelude
         self.card_bundle = card_bundle
         self.rng = np.random.default_rng()
-        self.postprocessors = []
         self.event_listeners = []  # remember to use weakrefs
         self.default_energy = 3
         self.energy = self.default_energy
@@ -832,6 +848,21 @@ class BattleBundle:
     def prompt_injections(self) -> Iterator[str]:
         for has_description in self.active_items_with_description():
             yield from parse_stylize(has_description.description)
+        if snapshot := self.status_snapshot_text():
+            yield "Active statuses:\n" + snapshot
+
+    def status_snapshot_text(self) -> str:
+        lines = []
+        for battler in self.battlers():
+            for status in battler.status_effects:
+                status.describe_myself()
+                advisory = " advisory" if isinstance(status.defn.reaction, Advisory) else ""
+                lines.append(
+                    f"{battler.name}: {status.name} "
+                    f"({status.counter} {status.counter_type}{advisory})"
+                    f" - {status.description}"
+                )
+        return "\n".join(lines)
 
     def tentative_energy_cost(self) -> int:
         return calculate_total_cost(self.proposed_cards)
@@ -846,10 +877,16 @@ class BattleBundle:
                 return battler
         raise ValueError(f"No battler found with name '{name}'")
 
+    def search_exact(self, name: str) -> Battler | None:
+        normalized = name.strip().lower()
+        for battler in self.battlers():
+            if normalized in {battler.name.lower(), battler.name_stem.lower()}:
+                return battler
+        return None
+
     def process_effects(
         self, result: str, autoenqueue: bool = True, aggregate_mode: bool = False
     ) -> EffectGroup:
-        result = self.postprocess_result(result, aggregate_mode=aggregate_mode)
         substrings = flat_map(
             postprocess_common_mistake, parse_top_level_brackets(result)
         )
@@ -857,22 +894,71 @@ class BattleBundle:
         for substring in substrings:
             try:
                 parsed = parse_effect(substring, self.card_bundle)
+                commands = commands_from_effect(parsed)
             except ValueError:
                 logger.exception("Error parsing effect", substring=substring)
                 continue
-            match parsed:
-                case (target, effect):
-                    if effect.noop:
-                        continue
-                    battler = self.search(target)
-                    queued_turn = effect.delay + self.turn_counter
-                    group.append((battler, effect, queued_turn))
-                case effect:
-                    queued_turn = effect.delay + self.turn_counter
-                    group.append((None, effect, queued_turn))
+            for command in commands:
+                group.append(self._queued_effect_from_command(command))
         if autoenqueue:
             group.enqueue()
         return group
+
+    def _queued_effect_from_command(
+        self, command: BattleCommand
+    ) -> tuple[Battler | None, SinglePointEffect | GlobalEffect, int]:
+        parsed = effect_from_command(command, self.card_bundle)
+        match parsed:
+            case (target, effect):
+                battler = self.search(target)
+                return battler, effect, effect.delay + self.turn_counter
+            case effect:
+                return None, effect, effect.delay + self.turn_counter
+
+    def apply_command(
+        self,
+        command: BattleCommand,
+        caster: Battler | None = None,
+        rng: np.random.Generator | None = None,
+    ) -> tuple[Battler | None, SinglePointEffect | GlobalEffect] | None:
+        if rng is None:
+            rng = self.rng
+        parsed = effect_from_command(command, self.card_bundle)
+        match parsed:
+            case (target, effect):
+                if effect.noop:
+                    return None
+                battler = self.search(target)
+                if effect.delay > 0:
+                    self.effects.append(
+                        effect.delay + self.turn_counter, (battler, effect)
+                    )
+                    return battler, effect
+                applied_effect = self.apply_effect(caster, battler, effect, rng)
+                if applied_effect is None:
+                    return None
+                return battler, applied_effect
+            case effect:
+                if effect.delay > 0:
+                    self.effects.append(effect.delay + self.turn_counter, (None, effect))
+                    return None, effect
+                applied_effect = self.apply_effect(caster, None, effect, rng)
+                if applied_effect is None:
+                    return None
+                return None, applied_effect
+
+    def apply_commands(
+        self,
+        commands: list[BattleCommand],
+        caster: Battler | None = None,
+        rng: np.random.Generator | None = None,
+    ) -> ResolvedEffects:
+        applied = []
+        for command in commands:
+            if effect := self.apply_command(command, caster=caster, rng=rng):
+                applied.append(effect)
+        self.clear_dead()
+        return ResolvedEffects(applied)
 
     def flush_expired_effects(
         self, rng: np.random.Generator | None = None
@@ -893,8 +979,9 @@ class BattleBundle:
                     new_effects += self.process_effects(response, autoenqueue=False)
             if canceled:
                 continue
-            self.apply_effect(None, battler, effect, rng)
-            flushed.append((battler, effect))
+            applied_effect = self.apply_effect(None, battler, effect, rng)
+            if applied_effect is not None:
+                flushed.append((battler, applied_effect))
             logger.info(
                 "Effect applied",
                 battler=battler,
@@ -916,13 +1003,12 @@ class BattleBundle:
                 self.turn_counter % len(enemy.profile.pattern)
             ]
 
-    def emit_battler_event(self, battler: Battler, event: str) -> None:
-        self.process_effects(f"[{battler.name}: {event}]", aggregate_mode=True)
-        self.flush_expired_effects(self.rng)
-
     def on_turn_end(self) -> None:
         for battler in self.battlers():
-            self.emit_battler_event(battler, "end of turn")
+            self._dispatch_turn_event(battler, OnTurnEnd())
+            battler.on_turn_end()
+        self.flush_expired_effects(self.rng)
+        self.clear_dead()
 
     def resolve_player_cards(self, cards: list[Card]) -> ResolvedEffects:
         self.deduct_energy(calculate_total_cost(cards))
@@ -952,36 +1038,34 @@ class BattleBundle:
             return None
 
         target = self.enemies[0] if self.enemies else None
-        applied: list[tuple[Battler | None, SinglePointEffect]] = []
-
-        def apply(target: Battler, effect: SinglePointEffect) -> None:
-            self.apply_effect(self.player, target, effect, self.rng)
-            applied.append((target, effect))
+        commands: list[BattleCommand] = []
 
         match card_name:
             case "strike" if target:
-                apply(target, SinglePointEffect.from_damage(6))
+                commands.append(DealDamage(target=target.name, amount=6))
                 rarity = 1
             case "defend":
-                apply(self.player, SinglePointEffect(delta_shield=5))
+                commands.append(GainBlock(target=self.player.name, amount=5))
                 rarity = 1
             case "bash" if target:
-                apply(target, SinglePointEffect.from_damage(8))
+                commands.append(DealDamage(target=target.name, amount=8))
                 vulnerable = StatusDefinition(
-                    "vulnerable",
-                    Subst.parse(
-                        "[ME: damaged {:d}] -> [ME: damaged {{m[0] * 1.5}}];"
-                    ),
-                    "turns",
-                    "Takes 50% more attack damage.",
+                    name="vulnerable",
+                    trigger=OnDamageTaken(),
+                    reaction=ModifyAmount(expr="amount * 1.5"),
+                    counter_type="turns",
+                    description="Takes 50% more attack damage.",
                 )
-                apply(target, SinglePointEffect(add_status=(vulnerable, 2)))
+                commands.append(
+                    ApplyStatus(target=target.name, status=vulnerable, duration=2)
+                )
                 rarity = 2
             case _:
                 return None
 
-        self.clear_dead()
-        return ResolvedEffects(applied, rarity=rarity)
+        applied = self.apply_commands(commands, caster=self.player)
+        applied.rarity = rarity
+        return applied
 
     def resolve_enemy_actions(self) -> ResolvedEffects:
         if simple_effects := self.resolve_simple_enemy_actions():
@@ -993,6 +1077,7 @@ class BattleBundle:
             self.battle_prelude.description,
             player_hand=self.card_bundle.hand,
             resolve_player_actions=False,
+            additional_guidance=list(self.prompt_injections()),
             rules=self.formatted_rules(),
         )
         self.process_effects(resolved_results.results)
@@ -1000,19 +1085,23 @@ class BattleBundle:
         return expired_effects
 
     def resolve_simple_enemy_actions(self) -> ResolvedEffects | None:
-        applied: list[tuple[Battler | None, SinglePointEffect]] = []
+        commands_by_enemy: list[tuple[EnemyBattler, BattleCommand]] = []
         for enemy in self.enemies:
             intent = enemy.current_intent.lower()
             if match := parse("attack player for {:d} damage", intent):
-                effect = SinglePointEffect.from_damage(match.fixed[0])
-                self.apply_effect(enemy, self.player, effect, self.rng)
-                applied.append((self.player, effect))
+                commands_by_enemy.append(
+                    (enemy, DealDamage(target=self.player.name, amount=match.fixed[0]))
+                )
             elif match := parse("block for {:d} shield points", intent):
-                effect = SinglePointEffect(delta_shield=match.fixed[0])
-                self.apply_effect(enemy, enemy, effect, self.rng)
-                applied.append((enemy, effect))
+                commands_by_enemy.append(
+                    (enemy, GainBlock(target=enemy.name, amount=match.fixed[0]))
+                )
             else:
                 return None
+        applied = []
+        for enemy, command in commands_by_enemy:
+            if effect := self.apply_command(command, caster=enemy):
+                applied.append(effect)
         self.clear_dead()
         return ResolvedEffects(applied, rarity=1)
 
@@ -1075,9 +1164,14 @@ class BattleBundle:
                                 f"{battler.name} lost shield {single_effect.shield_loss}"
                             )
                         case SinglePointEffectType.STATUS:
-                            append_log(
-                                f"{battler.name} received status {single_effect.add_status[0].name}"
-                            )
+                            if single_effect.add_status:
+                                append_log(
+                                    f"{battler.name} received status {single_effect.add_status[0].name}"
+                                )
+                            elif single_effect.remove_status:
+                                append_log(
+                                    f"{battler.name} lost status {single_effect.remove_status}"
+                                )
                         case SinglePointEffectType.OTHER:
                             append_log(f"{battler.name} received other effect...")
                 case _:
@@ -1090,11 +1184,12 @@ class BattleBundle:
         target: Battler,
         effect: SinglePointEffect | GlobalEffect,
         rng: np.random.Generator,
-    ) -> None:
+    ) -> SinglePointEffect | GlobalEffect | None:
         if isinstance(effect, GlobalEffect):
             self._apply_global_effect(effect)
+            return effect
         else:
-            self._apply_targeted_effect(caster, target, effect, rng)
+            return self._apply_targeted_effect(caster, target, effect, rng)
 
     def deduct_energy(self, cost: int) -> None:
         self.energy = max(0, self.energy - cost)
@@ -1163,25 +1258,34 @@ class BattleBundle:
         target: Battler,
         effect: SinglePointEffect,
         rng: np.random.Generator,
-    ) -> None:
+    ) -> SinglePointEffect | None:
         if rng.random() > effect.accuracy:
-            return
+            return None
+
+        if caster is None and effect.source:
+            caster = self.search_exact(effect.source)
 
         is_critical = rng.random() < effect.critical_chance
         multiplier = 2 if is_critical else 1
 
         delta_hp = effect.delta_hp * multiplier
         delta_shield = effect.delta_shield * multiplier
+        if delta_shield > 0:
+            delta_shield = self._modify_block_gained(target, delta_shield)
+        applied_effect = replace(effect, delta_hp=delta_hp, delta_shield=delta_shield)
 
         target.shield_points += delta_shield
 
         if delta_hp < 0:
-            self._apply_damage(caster, target, effect, delta_hp)
+            applied_effect = self._apply_damage(caster, target, effect, delta_hp)
         else:
             self._apply_healing(target, delta_hp)
 
+        if effect.remove_status:
+            self._apply_remove_status(target, effect.remove_status)
         if effect.add_status:
             self._apply_add_status(target, effect.add_status)
+        return applied_effect
 
     def _apply_add_status(
         self,
@@ -1194,15 +1298,116 @@ class BattleBundle:
         else:
             realized.describe_myself()
         target.status_effects.append(realized)
-        self.postprocessors.append(weakref.WeakMethod(realized.apply))
 
-    def postprocess_result(self, result: str, aggregate_mode: bool = False) -> str:
-        self.postprocessors = [fn for fn in self.postprocessors if fn()]
-        if aggregate_mode:
-            return "\n".join([fn()(result) for fn in self.postprocessors])
-        for fn in self.postprocessors:
-            result = fn()(result)
-        return result
+    def _apply_remove_status(self, target: Battler, status_name: str) -> None:
+        target.status_effects = [
+            status
+            for status in target.status_effects
+            if status.name.lower() != status_name.lower()
+        ]
+
+    def _modify_damage_dealt(self, caster: Battler | None, amount: float) -> float:
+        if caster is None:
+            return amount
+        return self._modify_amount(caster, OnDamageDealt(), amount)
+
+    def _modify_damage_taken(self, target: Battler, amount: float) -> float:
+        return self._modify_amount(target, OnDamageTaken(), amount)
+
+    def _modify_block_gained(self, target: Battler, amount: float) -> float:
+        return self._modify_amount(target, OnBlockGained(), amount)
+
+    def _modify_amount(
+        self,
+        owner: Battler,
+        trigger: OnDamageDealt | OnDamageTaken | OnBlockGained,
+        amount: float,
+    ) -> float:
+        for status in list(owner.status_effects):
+            if status.is_expired() or not isinstance(status.defn.trigger, type(trigger)):
+                continue
+            reaction = status.defn.reaction
+            if not isinstance(reaction, ModifyAmount):
+                continue
+            try:
+                condition_matches = evaluate_status_condition(
+                    reaction.condition, amount=amount, counter=status.counter
+                )
+            except UnsafeStatusExpression:
+                logger.warning(
+                    "Skipping invalid status condition",
+                    status=status.name,
+                    condition=reaction.condition,
+                )
+                continue
+            if not condition_matches:
+                continue
+            try:
+                amount = evaluate_status_expr(
+                    reaction.expr, amount=amount, counter=status.counter
+                )
+            except UnsafeStatusExpression:
+                logger.warning(
+                    "Skipping invalid status expression",
+                    status=status.name,
+                    expr=reaction.expr,
+                )
+                continue
+            amount = max(amount, 0)
+            if reaction.consumes_counter or status.counter_type == "times":
+                status.counter -= 1
+        owner.remove_dead_status_effects()
+        return amount
+
+    def _evaluate_reaction_amount(
+        self, owner: Battler, status: StatusEffect, amount: float | str
+    ) -> float | None:
+        if not isinstance(amount, str):
+            return max(amount, 0)
+        try:
+            return max(
+                evaluate_status_expr(amount, amount=0, counter=status.counter),
+                0,
+            )
+        except UnsafeStatusExpression:
+            logger.warning(
+                "Skipping invalid status side effect",
+                owner=owner.name,
+                status=status.name,
+                expr=amount,
+            )
+            return None
+
+    def _dispatch_turn_event(
+        self,
+        owner: Battler,
+        trigger: OnTurnStart | OnTurnEnd,
+    ) -> None:
+        for status in list(owner.status_effects):
+            if status.is_expired() or not isinstance(status.defn.trigger, type(trigger)):
+                continue
+            match status.defn.reaction:
+                case DealDamageToSelf(amount=amount):
+                    evaluated = self._evaluate_reaction_amount(owner, status, amount)
+                    if evaluated is not None:
+                        self.apply_command(
+                            DealDamage(target=owner.name, amount=evaluated)
+                        )
+                case HealSelf(amount=amount):
+                    evaluated = self._evaluate_reaction_amount(owner, status, amount)
+                    if evaluated is not None:
+                        self.apply_command(Heal(target=owner.name, amount=evaluated))
+                case GainBlockReaction(amount=amount):
+                    evaluated = self._evaluate_reaction_amount(owner, status, amount)
+                    if evaluated is not None:
+                        self.apply_command(
+                            GainBlock(target=owner.name, amount=evaluated)
+                        )
+                case Advisory() | ModifyAmount():
+                    pass
+            if status.counter_type == "times":
+                status.counter -= 1
+        owner.remove_dead_status_effects()
 
     def _apply_damage(
         self,
@@ -1210,13 +1415,17 @@ class BattleBundle:
         target: Battler,
         effect: SinglePointEffect,
         delta_hp: float,
-    ) -> None:
+    ) -> SinglePointEffect:
         if delta_hp > 0:
             raise ValueError("delta_hp for damage must be a negative number")
         damage = -delta_hp
+        damage = self._modify_damage_dealt(caster, damage)
+        damage = self._modify_damage_taken(target, damage)
+        damage = max(damage, 0)
         damage_result = target.receive_damage(damage, effect.pierce)
         if effect.drain and caster:
             caster.receive_heal(damage_result.damage_dealt)
+        return replace(effect, delta_hp=-damage)
 
     def _apply_healing(self, target: Battler, delta_hp: float) -> None:
         target.receive_heal(delta_hp)
@@ -1231,6 +1440,9 @@ class BattleBundle:
         self.card_bundle.draw_to_hand()
         self.replenish_energy()
         self._on_turn_start()
+        self.flush_expired_effects(self.rng)
+        for battler in self.battlers():
+            self._dispatch_turn_event(battler, OnTurnStart())
         self.player.on_turn_start()
 
     def replenish_energy(self) -> None:

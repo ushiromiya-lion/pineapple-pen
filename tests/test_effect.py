@@ -1,4 +1,10 @@
-from genio.effect import SinglePointEffect, TargetedEffect, parse_targeted_effect
+from genio.effect import (
+    ModifyAmount,
+    OnDamageTaken,
+    SinglePointEffect,
+    TargetedEffect,
+    parse_targeted_effect,
+)
 
 
 def targeted_effect_equals_except_uuid(
@@ -62,10 +68,11 @@ def test_parse_targeted_effect():
 
 def test_parse_targeted_effect_status_effect():
     _, effect = parse_targeted_effect(
-        "[entity: +vulnerable [3 turns] [foo: {:d}] -> [foo: {{m[0] * 1.5}}];]"
+        "[entity: +vulnerable [3 turns] [ME: damaged {:d}] -> [ME: damaged {{m[0] * 1.5}}];]"
     )
     defn, counter = effect.add_status
     assert defn.counter_type == "turns"
     assert counter == 3
     assert defn.name == "vulnerable"
-    assert defn.subst.pattern == "[foo: {:d}]"
+    assert defn.trigger == OnDamageTaken()
+    assert defn.reaction == ModifyAmount(expr="amount * 1.5")
