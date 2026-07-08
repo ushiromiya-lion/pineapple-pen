@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 import uuid
 import weakref
 from collections import Counter, deque
@@ -15,7 +14,7 @@ from typing import Annotated, Generic, Literal
 
 import numpy as np
 import tiktoken
-from parse import parse
+from parse import parse, search
 from smallperm import sample, shuffle
 from structlog import get_logger
 from typing_extensions import (
@@ -64,9 +63,6 @@ def parse_card_description(description: str) -> tuple[str, str, int]:
         copies = 1
 
     return name, desc, copies
-
-
-from parse import search
 
 
 def create_deck(cards: list[str]) -> list[Card]:
@@ -413,7 +409,7 @@ class EventBus:
 class CardBundle:
     def __init__(self, deck: list[Card], hand_limit: int = 10) -> None:
         self.hand_limit = hand_limit
-        self.default_draw_count = 6
+        self.default_draw_count = 5
 
         seed = access_predef("system.seed", randint(0, 2**32 - 1))
         logger.info("CardBundle created", seed=seed)
@@ -486,6 +482,11 @@ class CardBundle:
         self.hand = []
         self.resolving = []
         self.events.append("flush_hand_resolving_to_graveyard")
+
+    def resolving_to_graveyard(self) -> None:
+        self.graveyard.extend(self.resolving)
+        self.resolving = []
+        self.events.append("resolving_to_graveyard")
 
     def add_to_hand(self, card: Card | list[Card]) -> None:
         if isinstance(card, Sequence):
@@ -815,7 +816,7 @@ class BattleBundle:
         self.rng = np.random.default_rng()
         self.postprocessors = []
         self.event_listeners = []  # remember to use weakrefs
-        self.default_energy = 2
+        self.default_energy = 3
         self.energy = self.default_energy
         self.proposed_cards = []
         self.battle_logs = []
@@ -925,6 +926,8 @@ class BattleBundle:
 
     def resolve_player_cards(self, cards: list[Card]) -> ResolvedEffects:
         self.deduct_energy(calculate_total_cost(cards))
+        if known_effects := self.resolve_known_player_cards(cards):
+            return known_effects
         resolved_results: ResolvedResults = _judge_results(
             cards,
             self.player,
@@ -940,7 +943,49 @@ class BattleBundle:
         expired_effects.rarity = resolved_results.significance
         return expired_effects
 
+    def resolve_known_player_cards(self, cards: list[Card]) -> ResolvedEffects | None:
+        if len(cards) != 1:
+            return None
+        card = cards[0]
+        card_name = card.name.lower().rstrip("+")
+        if card_name not in {"strike", "defend", "bash"}:
+            return None
+
+        target = self.enemies[0] if self.enemies else None
+        applied: list[tuple[Battler | None, SinglePointEffect]] = []
+
+        def apply(target: Battler, effect: SinglePointEffect) -> None:
+            self.apply_effect(self.player, target, effect, self.rng)
+            applied.append((target, effect))
+
+        match card_name:
+            case "strike" if target:
+                apply(target, SinglePointEffect.from_damage(6))
+                rarity = 1
+            case "defend":
+                apply(self.player, SinglePointEffect(delta_shield=5))
+                rarity = 1
+            case "bash" if target:
+                apply(target, SinglePointEffect.from_damage(8))
+                vulnerable = StatusDefinition(
+                    "vulnerable",
+                    Subst.parse(
+                        "[ME: damaged {:d}] -> [ME: damaged {{m[0] * 1.5}}];"
+                    ),
+                    "turns",
+                    "Takes 50% more attack damage.",
+                )
+                apply(target, SinglePointEffect(add_status=(vulnerable, 2)))
+                rarity = 2
+            case _:
+                return None
+
+        self.clear_dead()
+        return ResolvedEffects(applied, rarity=rarity)
+
     def resolve_enemy_actions(self) -> ResolvedEffects:
+        if simple_effects := self.resolve_simple_enemy_actions():
+            return simple_effects
         resolved_results: ResolvedResults = _judge_results(
             [],
             self.player,
@@ -953,6 +998,24 @@ class BattleBundle:
         self.process_effects(resolved_results.results)
         expired_effects = self.flush_expired_effects(self.rng)
         return expired_effects
+
+    def resolve_simple_enemy_actions(self) -> ResolvedEffects | None:
+        applied: list[tuple[Battler | None, SinglePointEffect]] = []
+        for enemy in self.enemies:
+            intent = enemy.current_intent.lower()
+            if match := parse("attack player for {:d} damage", intent):
+                effect = SinglePointEffect.from_damage(match.fixed[0])
+                self.apply_effect(enemy, self.player, effect, self.rng)
+                applied.append((self.player, effect))
+            elif match := parse("block for {:d} shield points", intent):
+                effect = SinglePointEffect(delta_shield=match.fixed[0])
+                self.apply_effect(enemy, enemy, effect, self.rng)
+                applied.append((enemy, effect))
+            else:
+                return None
+        self.clear_dead()
+        return ResolvedEffects(applied, rarity=1)
+
 
     def record_to_battle_logs(self, effects: ResolvedEffects) -> None:
         logs = self._transform_to_battle_logs(effects)
@@ -989,7 +1052,7 @@ class BattleBundle:
                             append_log(
                                 f"Transform {transform.from_card.name} to {transform.to_card.name}"
                             )
-                        case other:
+                        case _:
                             ...
                 case (battler, single_effect) if isinstance(
                     single_effect, SinglePointEffect
@@ -1126,7 +1189,10 @@ class BattleBundle:
         status: tuple[StatusDefinition, int],
     ) -> None:
         realized = StatusEffect(status[0], status[1], target)
-        realized.describe_myself()
+        if status[0].description:
+            realized.description = status[0].description
+        else:
+            realized.describe_myself()
         target.status_effects.append(realized)
         self.postprocessors.append(weakref.WeakMethod(realized.apply))
 
@@ -1168,7 +1234,7 @@ class BattleBundle:
         self.player.on_turn_start()
 
     def replenish_energy(self) -> None:
-        self.energy = max(self.default_energy, self.energy)
+        self.energy = self.default_energy
 
     def clear_dead(self) -> None:
         if self.player.is_dead():
@@ -1236,15 +1302,12 @@ def num_tokens(s: str | None) -> int:
 
 
 def calculate_energy_cost(cards: Sequence[Card]) -> int:
-    if not cards:
-        return 0
-    cost = 1
-    num_effective_tokens = 0
-    for card in cards:
-        num_effective_tokens += math.sqrt(max(num_tokens(card.description) - 5, 0))
-        num_effective_tokens += math.sqrt(max(num_tokens(card.name) - 5, 0))
-    if num_effective_tokens > 20:
-        cost += 1
-    if num_effective_tokens > 10:
-        cost += 1
-    return cost
+    return sum(card_energy_cost(card) for card in cards)
+
+
+def card_energy_cost(card: Card) -> int:
+    match card.name.lower().rstrip("+"):
+        case "bash":
+            return 2
+        case _:
+            return 1

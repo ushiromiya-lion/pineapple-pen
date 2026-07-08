@@ -39,6 +39,7 @@ from genio.components import (
     cute_text,
     dithering,
     draw_mixed_rounded_rect,
+    draw_rounded_rectangle,
     pal_single_color,
     retro_font,
     retro_text,
@@ -90,6 +91,16 @@ class CardState(Enum):
 
 def sin_01(t: float, dilation: float) -> float:
     return (math.sin(t * dilation) + 1) / 2
+
+
+def parse_intent_attack(intent: str) -> int | None:
+    words = intent.lower().split()
+    if len(words) == 5 and words[:3] == ["attack", "player", "for"]:
+        try:
+            return int(words[3])
+        except ValueError:
+            return None
+    return None
 
 
 class CardSprite:
@@ -359,6 +370,10 @@ class CardSprite:
                     and self.dragging_time < 10
                     and not self.app.should_all_cards_disabled()
                 ):
+                    if not self.selected:
+                        for card in self.app.card_sprites:
+                            if card is not self:
+                                card.selected = False
                     self.selected = not self.selected
 
         if self.dragging:
@@ -716,17 +731,23 @@ class EnemyBattlerSprite:
                 layout(w=100, ha="left"),
                 dither_mult=self.opacity,
             )
-            self.scene._draw_hearts_and_shields(
-                10 + self.x - 31, 131, e.hp, e.shield_points
+            self.scene.draw_hp_and_block(
+                10 + self.x - 31,
+                131,
+                58,
+                e.hp,
+                e.max_hp,
+                e.shield_points,
             )
             pyxel.clip(10 + self.x - 30 - 5, 141, 68, 7)
-            text_width = retro_font.rasterize(e.current_intent, 5, 255, 0, 0).width + 14
+            intent = self.scene.intent_label(e.current_intent)
+            text_width = retro_font.rasterize(intent, 5, 255, 0, 0).width + 14
             pyxel.dither(self.opacity)
             for i in range(2):
                 retro_text(
                     -25 + self.x - (self.scene.timer) % text_width + i * text_width,
                     141,
-                    self.battler.current_intent,
+                    intent,
                     col=7,
                 )
             pyxel.clip()
@@ -1175,6 +1196,9 @@ class MainScene(Scene):
         ]
 
     def can_resolve_new_cards(self) -> bool:
+        selected_cards = [card for card in self.card_sprites if card.selected]
+        if len(selected_cards) != 1:
+            return False
         if self.bundle.energy - self.bundle.tentative_energy_cost() < 0:
             return False
         return (
@@ -1294,6 +1318,7 @@ class MainScene(Scene):
                 s.play_death_animation()
 
     def update_buttons_state(self):
+        selected_cards = [card for card in self.card_sprites if card.selected]
         if self.bundle.energy <= 0:
             self.play_button.state = ImageButtonState.DISABLED
             self.end_button.state = ImageButtonState.FLASHING
@@ -1303,16 +1328,18 @@ class MainScene(Scene):
 
         if self.bundle.energy - self.bundle.tentative_energy_cost() < 0:
             self.play_button.state = ImageButtonState.DISABLED
+        if len(selected_cards) != 1:
+            self.play_button.state = ImageButtonState.DISABLED
 
     def schedule_in(self, delay: int, fn: Callable[[], None]) -> None:
         self.tweener.append(range(delay), Instant(fn))
 
     def play_selected(self) -> None:
+        selected_card_sprites = [card for card in self.card_sprites if card.selected]
+        if len(selected_card_sprites) != 1:
+            return
         emit_sound_event(SoundEv.CONFIRM)
         self.wait_anim_countdown = 30
-        selected_card_sprites = [card for card in self.card_sprites if card.selected]
-        if not selected_card_sprites:
-            return
         selected_cards = [card.card for card in selected_card_sprites]
         self.bundle.card_bundle.hand_to_resolving(selected_cards)
         self.tmp_card_sprites.extend(selected_card_sprites)
@@ -1347,7 +1374,7 @@ class MainScene(Scene):
     def move_away_cards(self):
         for i, card in enumerate(self.tmp_card_sprites):
             card.try_transitioning_to_resolved(i)
-        self.bundle.card_bundle.resolving.clear()
+        self.bundle.card_bundle.resolving_to_graveyard()
 
     def play_effects(self, effects: ResolvedEffects) -> None:
         for target_effect in effects:
@@ -1412,26 +1439,44 @@ class MainScene(Scene):
             return True
         return self.zero_energy_timer > 30
 
-    def _draw_hearts_and_shields(self, x: int, y: int, hp: int, shield: int) -> None:
-        icons = load_image("ui", "icons.png")
-        cursor = x
-        num_hp = hp
-        num_shield = shield
-        while num_hp and num_hp >= 2:
-            pyxel.blt(cursor, y, icons, 0, 0, 8, 64, colkey=254)
-            cursor += 10
-            num_hp -= 2
-        if num_hp:
-            pyxel.blt(cursor, y, icons, 10, 0, 8, 64, colkey=254)
-            cursor += 10
-        while num_shield and num_shield >= 2:
-            pyxel.blt(cursor, y, icons, 20, 0, 8, 64, colkey=254)
-            cursor += 8
-            num_shield -= 2
-        if num_shield:
-            cursor += 1
-            pyxel.blt(cursor, y, icons, 29, 0, 8, 64, colkey=254)
-            cursor += 8
+    def draw_hp_and_block(
+        self, x: int, y: int, width: int, hp: int, max_hp: int, shield: int
+    ) -> None:
+        bar_height = 8
+        max_hp = max(max_hp, 1)
+        hp = max(0, min(hp, max_hp))
+        fill_width = int((width - 2) * hp / max_hp)
+        pyxel.rect(x, y, width, bar_height, 0)
+        pyxel.rect(x + 1, y + 1, width - 2, bar_height - 2, 1)
+        if fill_width:
+            pyxel.rect(x + 1, y + 1, fill_width, bar_height - 2, 8)
+            with dithering(0.35):
+                pyxel.rect(x + 1, y + 1, fill_width, 2, 9)
+        pyxel.rectb(x, y, width, bar_height, 7)
+        retro_text(
+            x + 3,
+            y,
+            f"{hp}/{max_hp}",
+            7,
+            layout=layout(w=width - 6, h=bar_height, ha="center", va="center"),
+        )
+        if shield > 0:
+            draw_rounded_rectangle(x + width + 4, y - 1, 22, bar_height + 2, 2, 1)
+            pyxel.rectb(x + width + 4, y - 1, 22, bar_height + 2, 7)
+            retro_text(
+                x + width + 6,
+                y,
+                f"B {shield}",
+                7,
+                layout=layout(w=18, h=bar_height, ha="center", va="center"),
+            )
+
+    @staticmethod
+    def intent_label(intent: str) -> str:
+        intent = intent.strip()
+        if match := parse_intent_attack(intent):
+            return f"Attack {match}"
+        return intent
 
     def draw(self):
         self.draw_background()
@@ -1554,19 +1599,20 @@ class MainScene(Scene):
         self.enemy_sprites[i].draw()
         pyxel.blt(10 + x - 36, 126, short_holder, 0, 0, 80, 64, colkey=254)
         shadowed_text(10 + x - 30, 121, e.name, 7, layout(w=80, ha="left"))
-        self._draw_hearts_and_shields(10 + x - 31, 131, e.hp, e.shield_points)
+        self.draw_hp_and_block(10 + x - 31, 131, 58, e.hp, e.max_hp, e.shield_points)
         pyxel.clip(10 + x - 30 - 5, 141, 68, 7)
-        text_width = retro_font.rasterize(e.current_intent, 5, 255, 0, 0).width + 14
+        intent = self.intent_label(e.current_intent)
+        text_width = retro_font.rasterize(intent, 5, 255, 0, 0).width + 14
         retro_text(
             -25 + x - (self.timer) % text_width,
             141,
-            e.current_intent,
+            intent,
             col=7,
         )
         retro_text(
             -25 + x - (self.timer) % text_width + text_width,
             141,
-            e.current_intent,
+            intent,
             col=7,
         )
         pyxel.clip()
@@ -1592,7 +1638,9 @@ class MainScene(Scene):
         pyxel.blt(-10, 147 + 10, long_holder, 0, 0, 130, 30, colkey=254)
         self.player_sprite.draw()
         shadowed_text(51, 147 + 5, player.name_stem, 7, layout(w=80, ha="left"))
-        self._draw_hearts_and_shields(50, 162, player.hp, player.shield_points)
+        self.draw_hp_and_block(
+            50, 162, 58, player.hp, player.max_hp, player.shield_points
+        )
 
     def draw_crosshair(self, x, y):
         cursor = load_image("cursor.png")

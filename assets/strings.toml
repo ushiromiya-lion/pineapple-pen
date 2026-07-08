@@ -1,6 +1,6 @@
 [players.starter]
 name = "Celine, the Magical Swordswoman"
-hit_points = 7
+hit_points = 80
 mp = 6
 profile = """
 Celine, the Magical Swordswoman, is a fierce and determined warrior with an ethereal touch. Her petite frame belying the formidable strength and agility she possesses. Her short, auburn hair cascades around her heart-shaped face, and her bright green eyes, filled with a piercing intensity, reflect the fire of her unyielding spirit.
@@ -14,12 +14,9 @@ Driven by a quest for justice and an insatiable curiosity, Celine ventures throu
 [initial_deck]
 
 cards = [
-    "left * 3",
-    "right * 3",
-    "Smash * 1 # Deal 1 damage and apply vulnerable for 2 turn.",
-    "Slash * 4 # Deal 2 damage to a target.",
-    "Block * 3 # Gain 1 shield point.",
-    "4 of Spades * 2",
+    "Strike * 5 # Deal 6 damage.",
+    "Defend * 4 # Gain 5 Block.",
+    "Bash * 1 # Deal 8 damage. Apply 2 Vulnerable.",
 ]
 
 
@@ -35,6 +32,13 @@ hit_points = 4
 description = "A cursed golem that feeds on the fear of its victims, the Stone Golem haunts the dreams of the unwary."
 pattern = ["attack player for 2 damage", "block for 1 shield points"]
 chara = "mechanical golem"
+
+[enemies.sneaky_gremlin]
+name = "Sneaky Gremlin"
+hit_points = 30
+description = "A nimble knife-fighter used as a simple first combat prototype enemy."
+pattern = ["attack player for 10 damage"]
+chara = "thief"
 
 [enemies.grove_guardian]
 name = "Spire Guardian"

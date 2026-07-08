@@ -9,7 +9,9 @@ from genio.battle import (
     EnemyProfile,
     PlayerBattler,
     PlayerProfile,
+    calculate_energy_cost,
 )
+from genio.card import Card
 from genio.effect import SinglePointEffect
 
 
@@ -31,6 +33,49 @@ def test_battlers_basic(card_bundle):
     assert len(battlers) == 3
     assert player in battlers
     assert enemy1 in battlers
+
+
+def test_sts_turn_baseline(card_bundle):
+    player = PlayerBattler.from_predef("players.starter")
+    enemy = EnemyBattler.from_predef("enemies.slime")
+    manager = BattleBundle(player, [enemy], BattlePrelude.default(), card_bundle)
+
+    assert player.max_hp == 80
+    assert card_bundle.default_draw_count == 5
+    assert manager.default_energy == 3
+
+
+def test_discrete_card_energy_costs():
+    assert calculate_energy_cost([Card("Strike")]) == 1
+    assert calculate_energy_cost([Card("Bash")]) == 2
+    assert calculate_energy_cost([Card("Strike"), Card("Bash")]) == 3
+
+
+def test_known_sts_cards_resolve_without_llm(card_bundle):
+    player = PlayerBattler.from_predef("players.starter")
+    enemy = EnemyBattler.from_predef("enemies.sneaky_gremlin")
+    manager = BattleBundle(player, [enemy], BattlePrelude.default(), card_bundle)
+
+    manager.resolve_player_cards([Card("Strike")])
+    assert enemy.hp == 24
+
+    manager.resolve_player_cards([Card("Defend")])
+    assert player.shield_points == 5
+
+    manager.replenish_energy()
+    manager.resolve_player_cards([Card("Bash")])
+    assert enemy.hp == 16
+    assert enemy.status_effects[0].name == "vulnerable"
+
+
+def test_simple_enemy_intent_resolves_without_llm(card_bundle):
+    player = PlayerBattler.from_predef("players.starter")
+    enemy = EnemyBattler.from_predef("enemies.sneaky_gremlin")
+    manager = BattleBundle(player, [enemy], BattlePrelude.default(), card_bundle)
+
+    manager.resolve_enemy_actions()
+
+    assert player.hp == 70
 
 
 def test_search_existing_battler():
