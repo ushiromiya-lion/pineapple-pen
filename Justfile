@@ -6,15 +6,15 @@ clear:
     rm -r .cache
 
 edit:
-    poetry run pyxel edit assets/sprites.pyxres
+    uv run pyxel edit assets/sprites.pyxres
 
 play:
-    poetry run python -m genio.main
+    uv run python -m genio.main
 
 ps:
-    poetry run python -m genio.main --edit
+    uv run python -m genio.main --edit
 
 convert-videos:
-    poetry run python -m genio.gears.h264_encoder
+    uv run python -m genio.gears.h264_encoder
 
 # Use `pv` to rate-limit.

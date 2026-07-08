@@ -1,59 +1,60 @@
-[tool.poetry]
+[project]
 name = "genio"
 version = "0.1.0"
 description = ""
-authors = ["RuneBlaze <runeblaze@excite.co.jp>"]
+authors = [{ name = "RuneBlaze", email = "runeblaze@excite.co.jp" }]
+requires-python = ">=3.10,<3.11"
 readme = "README.md"
+dependencies = [
+    "langchain==0.2.0",
+    "icecream>=2.1.3,<3",
+    "pandas",
+    "openpyxl>=3.1.2,<4",
+    "tomlkit>=0.12.3,<0.13",
+    "jupyter>=1.0.0,<2",
+    "structlog>=24.1.0,<25",
+    "langchain-google-genai>=1.0.4,<2",
+    "openai>=1.12.0,<2",
+    "humanize>=4.9.0,<5",
+    "rich>=13.7.0,<14",
+    "jinja2>=3.1.3,<4",
+    "typer>=0.9.0,<0.10",
+    "json5>=0.9.18,<0.10",
+    "logfire>=0.35.0,<0.36",
+    "mistune>=3.0.2,<4",
+    "boltons>=24.0.0,<25",
+    "pyxel>=2.1.4,<3",
+    "pillow==9.5.0",
+    "smallperm>=0.1.10,<0.2",
+    "parse>=1.20.2,<2",
+    "pyxelxl>=0.0.18,<0.0.19",
+    "safetensors>=0.4.3,<0.5",
+    "lupa~=2.2",
+    "pytweening>=1.2.0,<2",
+    "tiktoken>=0.7.0,<0.8",
+    "atomicx>=0.0.12,<0.0.13",
+    "embeddings>=0.0.8,<0.0.9",
+    "cramjam>=2.8.3,<3",
+    "einops>=0.8.0,<0.9",
+    "webp>=0.4.0,<0.5",
+    "hnswlib>=0.8.0,<0.9",
+    "soundfile>=0.12.1,<0.13",
+    "librosa>=0.10.2.post1,<0.11",
+]
 
-[tool.poetry.dependencies]
-python = ">=3.10,<4.0"
-langchain = "0.2.0"
-icecream = "^2.1.3"
-pandas = "*"
-openpyxl = "^3.1.2"
-tomlkit = "^0.12.3"
-jupyter = "^1.0.0"
-structlog = "^24.1.0"
-langchain-google-genai = "^1.0.4"
-openai = "^1.12.0"
-humanize = "^4.9.0"
-rich = "^13.7.0"
-jinja2 = "^3.1.3"
-typer = "^0.9.0"
-json5 = "^0.9.18"
-logfire = "^0.35.0"
-mistune = "^3.0.2"
-boltons = "^24.0.0"
-pyxel = "^2.1.4"
-pillow = "9.5.0"
-smallperm = "^0.1.10"
-parse = "^1.20.2"
-pyxelxl = "^0.0.18"
-safetensors = "^0.4.3"
-lupa = "^2.2"
-pytweening = "^1.2.0"
-tiktoken = "^0.7.0"
-atomicx = "^0.0.12"
-embeddings = "^0.0.8"
-cramjam = "^2.8.3"
-einops = "^0.8.0"
-webp = "^0.4.0"
-hnswlib = "^0.8.0"
-soundfile = "^0.12.1"
-librosa = "^0.10.2.post1"
+[dependency-groups]
+dev = [
+    "ruff>=0.2.1,<0.3",
+    "pytest>=8.0.1,<9",
+    "pytest-sugar>=1.0.0,<2",
+]
 
-
-[tool.poetry.group.dev.dependencies]
-ruff = "^0.2.1"
-pytest = "^8.0.1"
-pytest-sugar = "^1.0.0"
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
 
 [tool.ruff.lint]
 select = ["I", "UP","E4", "E7", "E9", "F", "TID252"]
 
 [tool.ruff]
 target-version = "py310"
-
-[build-system]
-requires = ["poetry-core"]
-build-backend = "poetry.core.masonry.api"

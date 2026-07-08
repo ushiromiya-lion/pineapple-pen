@@ -5,14 +5,14 @@ A roguelike deckbuilder, code-name `genio`.
 
 ## Setting Up
 
-We tested with Python 3.10.12 (but any Python above 3.10) should work. Our testing was done on an Apple M1 MacBook Pro, but nothing in the code should be platform-specific. Remember to install SDL2 `sudo apt-get install -y libsdl2-2.0-0` if on Ubuntu, possibly also required on macOS if SDL is reported to be missing.
+We tested with Python 3.10.12. The project is pinned to Python 3.10 via `.python-version` and `pyproject.toml`. Our testing was done on an Apple M1 MacBook Pro, but nothing in the code should be platform-specific. Remember to install SDL2 `sudo apt-get install -y libsdl2-2.0-0` if on Ubuntu, possibly also required on macOS if SDL is reported to be missing.
 
-We use [Just](https://github.com/casey/just) as our command runner, and [Poetry](https://python-poetry.org/) to manage dependencies. Install both for the smoothest experience.
+We use [Just](https://github.com/casey/just) as our command runner, and [uv](https://docs.astral.sh/uv/) to manage Python, dependencies, and the project virtual environment. Install both for the smoothest experience.
 
 To install Python dependencies:
 
 ```bash
-poetry install
+uv sync
 ```
 
 Checkout commit `4f24a925844396d175e5ca3e80d8954351a493cc` if you want to see the code at the end of the competition.
@@ -27,9 +27,9 @@ just play # Run the main scene, where you play cards and fight enemies.
 
 Others scenes to run:
 
- - `poetry run python -m genio.main --module genio.scene_stages` to run the stage selection scene
- - `poetry run python -m genio.main --module genio.scene_booster` to run the booster pack / stage results scene
- - `poetry run python -m genio.main --module genio.scene_intro` to run the "explanation" or intro scene
+ - `uv run python -m genio.main --module genio.scene_stages` to run the stage selection scene
+ - `uv run python -m genio.main --module genio.scene_booster` to run the booster pack / stage results scene
+ - `uv run python -m genio.main --module genio.scene_intro` to run the "explanation" or intro scene
 
 To add/test new cards, the simplest way is to modify `strings.toml` inside `assets`.
 
