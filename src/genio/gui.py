@@ -74,6 +74,12 @@ from genio.layout import (
 from genio.ps import Anim
 from genio.scene import EmitSound, Scene, emit_sound_event
 from genio.sound_events import SoundEv
+from genio.stagegen import (
+    GenerateLetterReplacementResult,
+    GeneratePrefixCardResult,
+    generate_letter_replacement_description,
+    generate_prefix_card_description,
+)
 from genio.tween import Instant, MutableTweening, Mutator, Shake, Tweener
 from genio.utils.weaklist import WeakList
 
@@ -101,6 +107,32 @@ def parse_intent_attack(intent: str) -> int | None:
         except ValueError:
             return None
     return None
+
+
+LETTER_KEYS = tuple(
+    (getattr(pyxel, f"KEY_{chr(ord('A') + ix)}"), chr(ord("a") + ix))
+    for ix in range(26)
+)
+HAND_SELECT_KEYS = tuple((getattr(pyxel, f"KEY_{ix}"), ix - 1) for ix in range(1, 10))
+HAND_SELECT_KEYS += ((pyxel.KEY_0, 9),)
+
+
+def is_letter_replacer_card(card: Card) -> bool:
+    return card.name.lower().rstrip("+") == "letter replacer"
+
+
+def title_letter_indexes(name: str) -> list[int]:
+    return [ix for ix, letter in enumerate(name) if letter.isalpha()]
+
+
+def replace_title_letter(name: str, letter_index: int, new_letter: str) -> str:
+    if letter_index < 0 or letter_index >= len(name):
+        return name
+    old_letter = name[letter_index]
+    if not old_letter.isalpha():
+        return name
+    replacement = new_letter.upper() if old_letter.isupper() else new_letter.lower()
+    return f"{name[:letter_index]}{replacement}{name[letter_index + 1:]}"
 
 
 class CardSprite:
@@ -307,6 +339,15 @@ class CardSprite:
                             colkey=254,
                             rot=self.rotation,
                         )
+            if self.card.prefix_pending:
+                pyxel.rect(int(self.x) + 12, int(self.y) + 31, self.width - 24, 10, 0)
+                retro_text(
+                    int(self.x) + 12,
+                    int(self.y) + 32,
+                    "...",
+                    7,
+                    layout=layout(w=self.width - 24, ha="center"),
+                )
 
     def draw_highlighted_edges(self):
         if self.highlight_timer > 0:
@@ -347,6 +388,9 @@ class CardSprite:
             self.hover_timer += 1
 
     def update_active(self):
+        if self.app.should_all_cards_disabled():
+            self.dragging = False
+            return
         if self.index >= self.deck_length:
             for i, card in enumerate(self.app.card_sprites):
                 card.change_index(i)
@@ -364,6 +408,8 @@ class CardSprite:
         if pyxel.btnr(pyxel.MOUSE_BUTTON_LEFT):
             if self.dragging:
                 self.dragging = False
+                if self.app.try_play_card_sprite(self):
+                    return
                 ix_changed = self.snap_to_grid()
                 if (
                     not ix_changed
@@ -1062,7 +1108,7 @@ class Drawable(Updatable):
 class MainScene(Scene):
     card_bundle: CardBundle
     anims: list[Anim]
-    futures: deque[Future[ResolvedEffects]]
+    futures: deque[tuple[Future[ResolvedEffects], bool]]
 
     card_sprites: list[CardSprite]
     bundle: BattleBundle
@@ -1127,7 +1173,16 @@ class MainScene(Scene):
             s.x = x
             s.y = 60
 
-        self.futures = deque()
+        self.futures: deque[tuple[Future[ResolvedEffects], bool]] = deque()
+        self.prefix_futures: deque[
+            tuple[Future[GeneratePrefixCardResult], str]
+        ] = deque()
+        self.letter_replacement_futures: deque[
+            tuple[Future[GenerateLetterReplacementResult], str]
+        ] = deque()
+        self.letter_replacer_card: Card | None = None
+        self.letter_replacer_target_id: str | None = None
+        self.letter_replacer_letter_index: int | None = None
         self.buffer = pyxel.Image(427, 240)
         self.framing = ResolvingFraming(self)
         self.framing.rarity = 2
@@ -1196,8 +1251,12 @@ class MainScene(Scene):
         ]
 
     def can_resolve_new_cards(self) -> bool:
+        if self.letter_replacer_card:
+            return False
         selected_cards = [card for card in self.card_sprites if card.selected]
         if len(selected_cards) != 1:
+            return False
+        if not selected_cards[0].card.is_playable_prefix_state():
             return False
         if self.bundle.energy - self.bundle.tentative_energy_cost() < 0:
             return False
@@ -1232,11 +1291,16 @@ class MainScene(Scene):
                 self.wait_anim_countdown = 0
             else:
                 self.wait_anim_countdown -= 1
-        if pyxel.btnp(pyxel.KEY_SPACE) and self.can_resolve_new_cards():
-            self.play_selected()
+        input_mode_active = self.update_letter_replacer_input()
+        if not input_mode_active:
+            input_mode_active = self.update_prefix_card_input()
+        if not input_mode_active:
+            self.update_hand_selection_shortcuts()
+            if pyxel.btnp(pyxel.KEY_SPACE) and self.can_resolve_new_cards():
+                self.play_selected()
 
-        if pyxel.btnp(pyxel.KEY_Z):
-            self.end_player_turn()
+            if pyxel.btnp(pyxel.KEY_E):
+                self.end_player_turn()
 
         for card in self.card_sprites:
             card.update()
@@ -1250,10 +1314,10 @@ class MainScene(Scene):
         self.pieces = [piece for piece in self.pieces if not piece.is_dead()]
         self.weather.update()
 
-        if self.image_buttons[0].update():
+        if not input_mode_active and self.image_buttons[0].update():
             self.play_selected()
 
-        if self.image_buttons[1].update():
+        if not input_mode_active and self.image_buttons[1].update():
             self.end_player_turn()
 
         self.energy_renderer.update()
@@ -1268,9 +1332,14 @@ class MainScene(Scene):
             card for card in self.tmp_card_sprites if not card.is_dead()
         ]
 
-        self.bundle.proposed_cards = [
-            card.card for card in self.card_sprites if card.selected
-        ]
+        if self.letter_replacer_card:
+            self.bundle.proposed_cards = []
+        else:
+            self.bundle.proposed_cards = [
+                card.card
+                for card in self.card_sprites
+                if card.selected and card.card.is_playable_prefix_state()
+            ]
 
         self.tweener.update()
         self.tooltip.update()
@@ -1299,6 +1368,8 @@ class MainScene(Scene):
         self.sync_enemy_sprites()
         self.framing.update()
         self.check_mailbox()
+        self.check_prefix_mailbox()
+        self.check_letter_replacement_mailbox()
         self.update_buttons_state()
         self.tweens_signpost.update()
         self.background_video.update()
@@ -1319,6 +1390,10 @@ class MainScene(Scene):
 
     def update_buttons_state(self):
         selected_cards = [card for card in self.card_sprites if card.selected]
+        if self.letter_replacer_card:
+            self.play_button.state = ImageButtonState.DISABLED
+            self.end_button.state = ImageButtonState.DISABLED
+            return
         if self.bundle.energy <= 0:
             self.play_button.state = ImageButtonState.DISABLED
             self.end_button.state = ImageButtonState.FLASHING
@@ -1330,42 +1405,364 @@ class MainScene(Scene):
             self.play_button.state = ImageButtonState.DISABLED
         if len(selected_cards) != 1:
             self.play_button.state = ImageButtonState.DISABLED
+        elif not selected_cards[0].card.is_playable_prefix_state():
+            self.play_button.state = ImageButtonState.DISABLED
 
     def schedule_in(self, delay: int, fn: Callable[[], None]) -> None:
         self.tweener.append(range(delay), Instant(fn))
 
-    def play_selected(self) -> None:
+    def update_hand_selection_shortcuts(self) -> None:
+        for key, index in HAND_SELECT_KEYS:
+            if not pyxel.btnp(key):
+                continue
+            if index >= len(self.card_sprites) or self.should_all_cards_disabled():
+                return
+            card_sprite = self.card_sprites[index]
+            if not card_sprite.can_transition_to_resolving():
+                return
+            for other in self.card_sprites:
+                other.selected = other is card_sprite
+            return
+
+    def try_play_card_sprite(self, card_sprite: CardSprite) -> bool:
+        if pyxel.mouse_y >= GRID_Y_START - 28:
+            return False
+        if card_sprite not in self.card_sprites or self.should_all_cards_disabled():
+            return False
+        for other in self.card_sprites:
+            other.selected = other is card_sprite
+        self.bundle.proposed_cards = (
+            [card_sprite.card] if card_sprite.card.is_playable_prefix_state() else []
+        )
+        if not self.can_resolve_new_cards():
+            return False
+        return self.play_selected()
+
+    def play_selected(self) -> bool:
         selected_card_sprites = [card for card in self.card_sprites if card.selected]
         if len(selected_card_sprites) != 1:
-            return
-        emit_sound_event(SoundEv.CONFIRM)
-        self.wait_anim_countdown = 30
+            return False
+        if not selected_card_sprites[0].card.is_playable_prefix_state():
+            return False
+        if is_letter_replacer_card(selected_card_sprites[0].card):
+            return self.begin_letter_replacer(selected_card_sprites[0])
         selected_cards = [card.card for card in selected_card_sprites]
+        uses_inference = self.bundle.player_cards_need_inference(selected_cards)
+        emit_sound_event(SoundEv.CONFIRM)
+        self.wait_anim_countdown = 30 if uses_inference else 8
         self.bundle.card_bundle.hand_to_resolving(selected_cards)
         self.tmp_card_sprites.extend(selected_card_sprites)
 
         self.card_sprites = [card for card in self.card_sprites if not card.selected]
-        self.framing.putup()
+        if uses_inference:
+            self.framing.putup()
         for i, card in enumerate(selected_card_sprites):
             card.try_transition_to_resolving()
         self.futures.append(
-            self.executor.submit(self.resolve_selected_cards, selected_cards)
+            (
+                self.executor.submit(self.resolve_selected_cards, selected_cards),
+                uses_inference,
+            )
+        )
+        return True
+
+    def begin_letter_replacer(self, replacer_sprite: CardSprite) -> bool:
+        target_sprites = [
+            sprite
+            for sprite in self.card_sprites
+            if sprite is not replacer_sprite and self.can_letter_replacer_target(sprite)
+        ]
+        if not target_sprites:
+            self.add_popup("No target", WINDOW_WIDTH // 2 - 20, 112, 8)
+            return False
+
+        emit_sound_event(SoundEv.CONFIRM)
+        replacer_sprite.selected = False
+        self.bundle.proposed_cards = []
+        self.bundle.card_bundle.hand_to_resolving([replacer_sprite.card])
+        self.letter_replacer_card = replacer_sprite.card
+        self.letter_replacer_target_id = None
+        self.letter_replacer_letter_index = None
+        self.add_popup("Choose card", WINDOW_WIDTH // 2 - 26, 112, 7)
+        return True
+
+    def can_letter_replacer_target(self, card_sprite: CardSprite) -> bool:
+        card = card_sprite.card
+        return (
+            card_sprite in self.card_sprites
+            and not is_letter_replacer_card(card)
+            and card.is_playable_prefix_state()
+            and bool(card.description)
+            and bool(title_letter_indexes(card.name))
         )
 
-    def check_mailbox(self):
-        while self.futures and self.futures[0].done():
-            effects = self.futures.popleft().result()
-            self.on_receive_mail(effects)
+    def clicked_card_sprite(self) -> CardSprite | None:
+        if not pyxel.btnr(pyxel.MOUSE_BUTTON_LEFT):
+            return None
+        for card_sprite in sorted(
+            self.card_sprites, key=lambda sprite: sprite.z_order(), reverse=True
+        ):
+            if card_sprite.is_mouse_over():
+                return card_sprite
+        return None
 
-    def on_receive_mail(self, effects: ResolvedEffects) -> None:
+    def letter_replacer_target_sprite(self) -> CardSprite | None:
+        if not self.letter_replacer_target_id:
+            return None
+        for card_sprite in self.card_sprites:
+            if card_sprite.card.id == self.letter_replacer_target_id:
+                return card_sprite
+        return None
+
+    def selected_title_letter_from_mouse(self, card_sprite: CardSprite) -> int | None:
+        positions = title_letter_indexes(card_sprite.card.name)
+        if not positions:
+            return None
+        name_length = len(card_sprite.card.name)
+        if name_length <= 5:
+            y_mult = 9
+        elif name_length <= 7:
+            y_mult = 8
+        else:
+            y_mult = 6
+        local_y = pyxel.mouse_y - card_sprite.y
+        ordinal = int((local_y - 2) // y_mult)
+        if 0 <= ordinal < len(positions):
+            return positions[ordinal]
+        return None
+
+    def selected_title_letter_from_key(self, card: Card) -> int | None:
+        positions = title_letter_indexes(card.name)
+        for key, ordinal in HAND_SELECT_KEYS:
+            if pyxel.btnp(key) and ordinal < len(positions):
+                return positions[ordinal]
+        return None
+
+    def cancel_letter_replacer(self) -> None:
+        if not self.letter_replacer_card:
+            return
+        self.bundle.card_bundle.resolving_to_hand([self.letter_replacer_card])
+        self.letter_replacer_card = None
+        self.letter_replacer_target_id = None
+        self.letter_replacer_letter_index = None
+        self.bundle.proposed_cards = []
+        for card_sprite in self.card_sprites:
+            card_sprite.selected = False
+
+    def confirm_letter_replacement(
+        self, target_sprite: CardSprite, letter_index: int, new_letter: str
+    ) -> None:
+        target = target_sprite.card
+        original_name = target.name
+        original_description = target.description
+        new_name = replace_title_letter(original_name, letter_index, new_letter)
+        target.begin_temporary_transform(new_name, None, card_art_name=None)
+        target_sprite.selected = False
+        target_sprite.refresh_art()
+        target_sprite.add_anim("anims.transform_card")
+        self.framing.putup()
+        self.letter_replacement_futures.append(
+            (
+                self.executor.submit(
+                    generate_letter_replacement_description,
+                    original_name,
+                    original_description,
+                    new_name,
+                    self.bundle.player.name_stem,
+                ),
+                target.id,
+            )
+        )
+
+    def update_letter_replacer_input(self) -> bool:
+        if not self.letter_replacer_card:
+            return False
+        if self.letter_replacement_futures:
+            return True
+        if pyxel.btnp(pyxel.KEY_ESCAPE):
+            self.cancel_letter_replacer()
+            return True
+
+        clicked_sprite = self.clicked_card_sprite()
+        target_sprite = self.letter_replacer_target_sprite()
+        had_target = target_sprite is not None
+        if clicked_sprite and self.can_letter_replacer_target(clicked_sprite):
+            target_sprite = clicked_sprite
+            self.letter_replacer_target_id = clicked_sprite.card.id
+            self.letter_replacer_letter_index = None
+            clicked_sprite.schedule_small_shake()
+            self.add_popup("Choose letter", WINDOW_WIDTH // 2 - 30, 112, 7)
+
+        if not target_sprite:
+            return True
+        if not self.can_letter_replacer_target(target_sprite):
+            self.cancel_letter_replacer()
+            return True
+
+        for card_sprite in self.card_sprites:
+            card_sprite.selected = card_sprite is target_sprite
+
+        if pyxel.btnp(pyxel.KEY_BACKSPACE):
+            self.letter_replacer_letter_index = None
+            return True
+
+        if self.letter_replacer_letter_index is None:
+            if had_target and clicked_sprite is target_sprite:
+                self.letter_replacer_letter_index = (
+                    self.selected_title_letter_from_mouse(target_sprite)
+                )
+                if self.letter_replacer_letter_index is not None:
+                    self.add_popup("Type letter", WINDOW_WIDTH // 2 - 24, 112, 7)
+            else:
+                key_letter_index = self.selected_title_letter_from_key(
+                    target_sprite.card
+                )
+                if key_letter_index is not None:
+                    self.letter_replacer_letter_index = key_letter_index
+                    self.add_popup("Type letter", WINDOW_WIDTH // 2 - 24, 112, 7)
+            return True
+
+        for key, letter in LETTER_KEYS:
+            if pyxel.btnp(key):
+                self.confirm_letter_replacement(
+                    target_sprite,
+                    self.letter_replacer_letter_index,
+                    letter,
+                )
+                return True
+        return True
+
+    def check_mailbox(self):
+        while self.futures and self.futures[0][0].done():
+            future, used_framing = self.futures.popleft()
+            try:
+                effects = future.result()
+            except Exception:
+                effects = ResolvedEffects([], rarity=1)
+                self.add_popup("No signal", WINDOW_WIDTH // 2 - 20, 112, 8)
+            self.on_receive_mail(effects, used_framing)
+
+    def check_prefix_mailbox(self) -> None:
+        while self.prefix_futures and self.prefix_futures[0][0].done():
+            future, card_id = self.prefix_futures.popleft()
+            try:
+                description = future.result().description
+            except Exception:
+                description = "Deal 6 damage."
+                self.add_popup("No signal", WINDOW_WIDTH // 2 - 20, 112, 8)
+            card = self.card_by_id(card_id)
+            card.finish_prefix_description(description)
+            for card_sprite in self.card_sprites:
+                if card_sprite.card.id == card_id:
+                    card_sprite.selected = False
+                    card_sprite.refresh_art()
+                    card_sprite.add_anim("anims.transform_card")
+                    break
+            self.schedule_in(15, lambda: self.framing.teardown())
+
+    def check_letter_replacement_mailbox(self) -> None:
+        while (
+            self.letter_replacement_futures
+            and self.letter_replacement_futures[0][0].done()
+        ):
+            future, card_id = self.letter_replacement_futures.popleft()
+            try:
+                description = future.result().description
+            except Exception:
+                description = "Deal 6 damage."
+                self.add_popup("No signal", WINDOW_WIDTH // 2 - 20, 112, 8)
+            card = self.card_by_id(card_id)
+            card.begin_temporary_transform(
+                card.name,
+                description,
+                card_art_name=card.card_art_name,
+            )
+            for card_sprite in self.card_sprites:
+                if card_sprite.card.id == card_id:
+                    card_sprite.selected = False
+                    card_sprite.refresh_art()
+                    card_sprite.add_anim("anims.transform_card")
+                    break
+            self.bundle.card_bundle.resolving_to_graveyard()
+            self.letter_replacer_card = None
+            self.letter_replacer_target_id = None
+            self.letter_replacer_letter_index = None
+            self.bundle.proposed_cards = []
+            self.schedule_in(15, lambda: self.framing.teardown())
+
+    def card_by_id(self, card_id: str) -> Card:
+        card_bundle = self.bundle.card_bundle
+        for card in (
+            card_bundle.deck
+            + card_bundle.hand
+            + card_bundle.graveyard
+            + card_bundle.resolving
+        ):
+            if card.id == card_id:
+                return card
+        raise ValueError(f"Card with id {card_id} not found")
+
+    def selected_prefix_sprite(self) -> CardSprite | None:
+        selected = [card for card in self.card_sprites if card.selected]
+        if len(selected) != 1:
+            return None
+        card_sprite = selected[0]
+        if not card_sprite.card.is_prefix_card():
+            return None
+        if card_sprite.card.is_playable_prefix_state():
+            return None
+        return card_sprite
+
+    def update_prefix_card_input(self) -> bool:
+        card_sprite = self.selected_prefix_sprite()
+        if not card_sprite:
+            return False
+        card = card_sprite.card
+        if card.prefix_pending:
+            return True
+        if pyxel.btnp(pyxel.KEY_ESCAPE):
+            card.reset_prefix_entry()
+            card_sprite.selected = False
+            card_sprite.refresh_art()
+            return True
+        if pyxel.btnp(pyxel.KEY_BACKSPACE):
+            card.pop_prefix_letter()
+            card_sprite.refresh_art()
+            return True
+        if pyxel.btnp(pyxel.KEY_RETURN) or pyxel.btnp(pyxel.KEY_KP_ENTER):
+            if card.is_prefix_filled():
+                card.confirm_prefix_entry()
+                card_sprite.refresh_art()
+                self.framing.putup()
+                self.prefix_futures.append(
+                    (
+                        self.executor.submit(
+                            generate_prefix_card_description,
+                            card.name,
+                            self.bundle.player.name_stem,
+                        ),
+                        card.id,
+                    )
+                )
+            return True
+        for key, letter in LETTER_KEYS:
+            if pyxel.btnp(key):
+                card.append_prefix_letter(letter)
+                card_sprite.refresh_art()
+                return True
+        return True
+
+    def on_receive_mail(self, effects: ResolvedEffects, used_framing: bool) -> None:
         if self.resolving_side == ResolvingSide.PLAYER:
             for in_progress_card in self.tmp_card_sprites:
                 in_progress_card.schedule_shake()
 
-        self.framing.on_rarity_determined(effects.rarity)
+        if used_framing:
+            self.framing.on_rarity_determined(effects.rarity)
         self.play_effects(effects)
         self.bundle.record_to_battle_logs(effects)
-        self.schedule_in(30, lambda: self.framing.teardown())
+        if used_framing:
+            self.schedule_in(30, lambda: self.framing.teardown())
         if self.resolving_side == ResolvingSide.PLAYER:
             self.schedule_in(0, lambda: self.move_away_cards())
         else:
@@ -1496,6 +1893,7 @@ class MainScene(Scene):
         card_draw_order = np.argsort([card.z_order() for card in self.card_sprites])
         for card_ix in card_draw_order:
             self.card_sprites[card_ix].draw()
+        self.draw_letter_replacer_overlay()
         for card in self.tmp_card_sprites:
             card.draw()
 
@@ -1569,6 +1967,46 @@ class MainScene(Scene):
 
         self.config_button.draw()
         self.about_button.draw()
+
+    def title_letter_marker_y(
+        self, card_sprite: CardSprite, letter_index: int
+    ) -> int | None:
+        positions = title_letter_indexes(card_sprite.card.name)
+        if letter_index not in positions:
+            return None
+        ordinal = positions.index(letter_index)
+        name_length = len(card_sprite.card.name)
+        if name_length <= 5:
+            y_mult = 9
+        elif name_length <= 7:
+            y_mult = 8
+        else:
+            y_mult = 6
+        return int(card_sprite.y + 4 + ordinal * y_mult)
+
+    def draw_letter_replacer_overlay(self) -> None:
+        if not self.letter_replacer_card:
+            return
+        for card_sprite in self.card_sprites:
+            if not self.can_letter_replacer_target(card_sprite):
+                continue
+            is_target = card_sprite.card.id == self.letter_replacer_target_id
+            color = 10 if is_target else 7
+            pyxel.rectb(
+                int(card_sprite.x) - 1,
+                int(card_sprite.y) - 1,
+                card_sprite.width + 2,
+                card_sprite.height + 2,
+                color,
+            )
+            if is_target and self.letter_replacer_letter_index is not None:
+                marker_y = self.title_letter_marker_y(
+                    card_sprite, self.letter_replacer_letter_index
+                )
+                if marker_y is not None:
+                    pyxel.rect(int(card_sprite.x) + 1, marker_y, 14, 8, 10)
+                    with dithering(0.5):
+                        pyxel.rect(int(card_sprite.x) + 1, marker_y, 14, 8, 7)
 
     def draw_background(self):
         buffer_as_arr = _image_as_ndarray(self.buffer)
@@ -1656,11 +2094,17 @@ class MainScene(Scene):
         for i, sprite in enumerate(self.card_sprites):
             sprite.try_transitioning_to_resolved(i, baseline=0.8)
         self.bundle.end_player_turn()
-        self.framing.putup()
-        self.futures.append(self.executor.submit(self.bundle.resolve_enemy_actions))
+        uses_inference = self.bundle.enemy_actions_need_inference()
+        if uses_inference:
+            self.framing.putup()
+        self.futures.append(
+            (self.executor.submit(self.bundle.resolve_enemy_actions), uses_inference)
+        )
 
-    def queue_up_future(self, *args, **kwargs):
-        self.futures.append(self.executor.submit(*args, **kwargs))
+    def queue_up_future(self, *args, uses_inference: bool = True, **kwargs):
+        if uses_inference:
+            self.framing.putup()
+        self.futures.append((self.executor.submit(*args, **kwargs), uses_inference))
 
     def start_new_turn(self):
         self.putup_player_signpost()

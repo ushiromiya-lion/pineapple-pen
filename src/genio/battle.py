@@ -65,6 +65,31 @@ def parse_card_description(description: str) -> tuple[str, str, int]:
     return name, desc, copies
 
 
+def parse_prefix_marker(description: str | None) -> tuple[int, int, int] | None:
+    if not description:
+        return None
+    parts = description.split()
+    if len(parts) not in {3, 5} or parts[0] != "@prefix":
+        return None
+    min_length = int(parts[1])
+    max_length = int(parts[2])
+    cost = 1
+    if len(parts) == 5:
+        if parts[3] != "cost":
+            return None
+        cost = int(parts[4])
+    return min_length, max_length, cost
+
+
+def parse_cost_marker(description: str | None) -> int | None:
+    if not description:
+        return None
+    parts = description.split()
+    if len(parts) == 2 and parts[0] == "@cost":
+        return int(parts[1])
+    return None
+
+
 def create_deck(cards: list[str]) -> list[Card]:
     deck = []
     for card_description in cards:
@@ -76,7 +101,32 @@ def create_deck(cards: list[str]) -> list[Card]:
             effective_name = bracket_part
 
         for _ in range(copies):
-            deck.append(Card(name=name, description=desc, card_art_name=effective_name))
+            if prefix_marker := parse_prefix_marker(desc):
+                min_length, max_length, cost = prefix_marker
+                deck.append(
+                    Card(
+                        name=name,
+                        description=None,
+                        card_art_name=effective_name,
+                        prefix=name,
+                        prefix_min_length=min_length,
+                        prefix_max_length=max_length,
+                        energy_cost=cost,
+                    )
+                )
+            elif (cost_marker := parse_cost_marker(desc)) is not None:
+                deck.append(
+                    Card(
+                        name=name,
+                        description=None,
+                        card_art_name=effective_name,
+                        energy_cost=cost_marker,
+                    )
+                )
+            else:
+                deck.append(
+                    Card(name=name, description=desc, card_art_name=effective_name)
+                )
     return deck
 
 
@@ -414,6 +464,7 @@ class CardBundle:
         seed = access_predef("system.seed", randint(0, 2**32 - 1))
         logger.info("CardBundle created", seed=seed)
 
+        self.rng = np.random.default_rng(seed)
         self.deck = shuffle(deck, seed=seed)
         self.hand = []
         self.graveyard = []
@@ -442,6 +493,15 @@ class CardBundle:
                 self.deck = shuffle(self.graveyard)
                 self.graveyard = []
             card = self.deck.pop()
+            if card.is_prefix_card():
+                card.prepare_prefix_draw(
+                    int(
+                        self.rng.integers(
+                            card.prefix_min_length,
+                            card.prefix_max_length + 1,
+                        )
+                    )
+                )
             yield card
             count -= 1
         self.events.append("draw")
@@ -475,6 +535,14 @@ class CardBundle:
         self.resolving.extend(cards)
         self.hand = [card for card in self.hand if card.id not in remove_card_uuids]
         self.events.append("hand_to_resolving")
+
+    def resolving_to_hand(self, cards: list[Card]) -> None:
+        remove_card_uuids = {card.id for card in cards}
+        self.hand.extend(cards)
+        self.resolving = [
+            card for card in self.resolving if card.id not in remove_card_uuids
+        ]
+        self.events.append("resolving_to_hand")
 
     def flush_hand_resolving_to_graveyard(self) -> None:
         self.graveyard.extend(self.hand)
@@ -550,6 +618,11 @@ class CardBundle:
         from_card.name = to_card.name
         from_card.description = to_card.description
         self.events.append("transform_card", from_card.id)
+
+    def revert_temporary_transforms(self) -> None:
+        for card in chain(self.deck, self.hand, self.graveyard, self.resolving):
+            card.revert_temporary_transform()
+        self.events.append("revert_temporary_transforms")
 
 
 @dataclass
@@ -943,12 +1016,16 @@ class BattleBundle:
         expired_effects.rarity = resolved_results.significance
         return expired_effects
 
+    def player_cards_need_inference(self, cards: list[Card]) -> bool:
+        return len(cards) != 1 or not card_can_resolve_without_llm(cards[0])
+
     def resolve_known_player_cards(self, cards: list[Card]) -> ResolvedEffects | None:
         if len(cards) != 1:
             return None
         card = cards[0]
         card_name = card.name.lower().rstrip("+")
-        if card_name not in {"strike", "defend", "bash"}:
+        card_description = normalized_card_description(card)
+        if not card_can_resolve_without_llm(card):
             return None
 
         target = self.enemies[0] if self.enemies else None
@@ -969,14 +1046,15 @@ class BattleBundle:
                 apply(target, SinglePointEffect.from_damage(8))
                 vulnerable = StatusDefinition(
                     "vulnerable",
-                    Subst.parse(
-                        "[ME: damaged {:d}] -> [ME: damaged {{m[0] * 1.5}}];"
-                    ),
+                    Subst.parse("[ME: damaged {:d}] -> [ME: damaged {{m[0] * 1.5}}];"),
                     "turns",
                     "Takes 50% more attack damage.",
                 )
                 apply(target, SinglePointEffect(add_status=(vulnerable, 2)))
                 rarity = 2
+            case _ if target and card_description == "deal 6 damage.":
+                apply(target, SinglePointEffect.from_damage(6))
+                rarity = 1
             case _:
                 return None
 
@@ -999,6 +1077,15 @@ class BattleBundle:
         expired_effects = self.flush_expired_effects(self.rng)
         return expired_effects
 
+    def enemy_actions_need_inference(self) -> bool:
+        return any(
+            not (
+                parse("attack player for {:d} damage", enemy.current_intent.lower())
+                or parse("block for {:d} shield points", enemy.current_intent.lower())
+            )
+            for enemy in self.enemies
+        )
+
     def resolve_simple_enemy_actions(self) -> ResolvedEffects | None:
         applied: list[tuple[Battler | None, SinglePointEffect]] = []
         for enemy in self.enemies:
@@ -1015,7 +1102,6 @@ class BattleBundle:
                 return None
         self.clear_dead()
         return ResolvedEffects(applied, rarity=1)
-
 
     def record_to_battle_logs(self, effects: ResolvedEffects) -> None:
         logs = self._transform_to_battle_logs(effects)
@@ -1228,6 +1314,7 @@ class BattleBundle:
 
     def start_new_turn(self) -> None:
         self.card_bundle.flush_hand_resolving_to_graveyard()
+        self.card_bundle.revert_temporary_transforms()
         self.card_bundle.draw_to_hand()
         self.replenish_energy()
         self._on_turn_start()
@@ -1291,6 +1378,9 @@ class MainSceneLike(CanAddAnim, Protocol):
     def should_wait_until_animation(self) -> bool:
         ...
 
+    def try_play_card_sprite(self, card_sprite: Any) -> bool:
+        ...
+
 
 enc = tiktoken.get_encoding("o200k_base")
 
@@ -1305,7 +1395,21 @@ def calculate_energy_cost(cards: Sequence[Card]) -> int:
     return sum(card_energy_cost(card) for card in cards)
 
 
+def normalized_card_description(card: Card) -> str:
+    return (card.description or "").lower().strip()
+
+
+def card_can_resolve_without_llm(card: Card) -> bool:
+    if normalized_card_description(card) == "deal 6 damage.":
+        return True
+    return card.name.lower().rstrip("+") in {"strike", "defend", "bash"}
+
+
 def card_energy_cost(card: Card) -> int:
+    if card.energy_cost is not None:
+        return card.energy_cost
+    if card.name.lower().rstrip("+") == "letter replacer":
+        return 0
     match card.name.lower().rstrip("+"):
         case "bash":
             return 2
