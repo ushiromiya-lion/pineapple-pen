@@ -88,7 +88,7 @@ class SinglePointEffect(BaseEffect):
             return SinglePointEffectType.SHIELD_GAIN
         if self.delta_shield < 0:
             return SinglePointEffectType.SHIELD_LOSS
-        if self.add_status:
+        if self.add_status or self.remove_status:
             return SinglePointEffectType.STATUS
         return SinglePointEffectType.OTHER
 
