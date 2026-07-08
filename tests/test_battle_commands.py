@@ -20,6 +20,7 @@ from genio.battle_commands import (
     RemoveStatus,
     TransformCard,
     command_from_effect,
+    commands_from_effect,
 )
 from genio.card import Card
 from genio.effect import (
@@ -155,3 +156,38 @@ def test_process_effects_uses_command_shim_for_existing_dsl():
 
     assert flushed.total_damage() == 3
     assert enemy.hp == enemy.max_hp - 3
+
+
+def test_combined_targeted_effect_splits_into_commands():
+    command_list = commands_from_effect(
+        ("Slime A", SinglePointEffect(delta_hp=-5, delta_shield=3))
+    )
+
+    assert command_list == [
+        GainBlock(target="Slime A", amount=3),
+        DealDamage(target="Slime A", amount=5),
+    ]
+
+
+def test_process_effects_preserves_combined_targeted_effects():
+    bundle = make_bundle()
+    enemy = bundle.enemies[0]
+
+    flushed = bundle.process_and_flush_effects(f"[{enemy.name}: damaged 5 | shield 3]")
+
+    assert flushed.total_shield_gain() == 3
+    assert flushed.total_damage() == 5
+    assert enemy.hp == enemy.max_hp - 2
+    assert enemy.shield_points == 0
+
+
+def test_apply_command_delay_flushes_on_new_turn():
+    bundle = make_bundle()
+    enemy = bundle.enemies[0]
+
+    bundle.apply_commands([DealDamage(target=enemy.name, amount=9, delay=1)])
+    assert enemy.hp == enemy.max_hp
+
+    bundle.start_new_turn()
+
+    assert enemy.hp == enemy.max_hp - 9

@@ -152,41 +152,63 @@ def _modifiers_from_command(command: CommandModifiers) -> dict:
 
 
 def command_from_effect(effect: Effect) -> BattleCommand | None:
+    commands = commands_from_effect(effect)
+    return commands[0] if commands else None
+
+
+def commands_from_effect(effect: Effect) -> list[BattleCommand]:
     match effect:
         case (target, single_effect):
-            return command_from_targeted_effect(target, single_effect)
+            return commands_from_targeted_effect(target, single_effect)
         case global_effect if isinstance(global_effect, GlobalEffect):
-            return command_from_global_effect(global_effect)
+            return [command_from_global_effect(global_effect)]
     raise ValueError(f"Unsupported effect: {effect}")
 
 
 def command_from_targeted_effect(
     target: str, effect: SinglePointEffect
 ) -> BattleCommand | None:
+    commands = commands_from_targeted_effect(target, effect)
+    return commands[0] if commands else None
+
+
+def commands_from_targeted_effect(
+    target: str, effect: SinglePointEffect
+) -> list[BattleCommand]:
     modifiers = _modifiers_from_effect(effect)
     if effect.noop:
-        return None
-    if effect.add_status:
-        status, duration = effect.add_status
-        return ApplyStatus(
-            target=target,
-            status=status,
-            duration=duration,
-            **modifiers,
-        )
-    if effect.remove_status:
-        return RemoveStatus(target=target, status_name=effect.remove_status, **modifiers)
+        return []
+    commands: list[BattleCommand] = []
+    if effect.delta_shield > 0:
+        commands.append(GainBlock(target=target, amount=effect.delta_shield, **modifiers))
+    if effect.delta_shield < 0:
+        commands.append(LoseBlock(target=target, amount=-effect.delta_shield, **modifiers))
     if effect.delta_hp < 0:
-        return DealDamage(
-            target=target, amount=-effect.delta_hp, source=effect.source, **modifiers
+        commands.append(
+            DealDamage(
+                target=target,
+                amount=-effect.delta_hp,
+                source=effect.source,
+                **modifiers,
+            )
         )
     if effect.delta_hp > 0:
-        return Heal(target=target, amount=effect.delta_hp, **modifiers)
-    if effect.delta_shield > 0:
-        return GainBlock(target=target, amount=effect.delta_shield, **modifiers)
-    if effect.delta_shield < 0:
-        return LoseBlock(target=target, amount=-effect.delta_shield, **modifiers)
-    return None
+        commands.append(Heal(target=target, amount=effect.delta_hp, **modifiers))
+    if effect.remove_status:
+        commands.append(
+            RemoveStatus(target=target, status_name=effect.remove_status, **modifiers)
+        )
+    if effect.add_status:
+        status, duration = effect.add_status
+        commands.append(
+            ApplyStatus(
+                target=target,
+                status=status,
+                duration=duration,
+                **modifiers,
+            )
+        )
+    return commands
 
 
 def command_from_global_effect(effect: GlobalEffect) -> BattleCommand:
