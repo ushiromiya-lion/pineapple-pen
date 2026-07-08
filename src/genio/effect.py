@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import re
 from dataclasses import dataclass, field
 from enum import Enum
@@ -7,9 +8,11 @@ from typing import Literal, Protocol, TypeAlias
 from uuid import uuid4
 
 from parse import search
+from structlog import get_logger
 
 from genio.card import Card
-from genio.subst import Subst
+
+logger = get_logger()
 
 
 @dataclass(eq=True, frozen=True)
@@ -26,10 +29,61 @@ class BaseEffect:
         return self.__dict__ | {"_uuid": None} == other.__dict__ | {"_uuid": None}
 
 
+@dataclass(eq=True, frozen=True)
+class OnDamageTaken:
+    pass
+
+
+@dataclass(eq=True, frozen=True)
+class OnDamageDealt:
+    pass
+
+
+@dataclass(eq=True, frozen=True)
+class OnTurnStart:
+    pass
+
+
+@dataclass(eq=True, frozen=True)
+class OnTurnEnd:
+    pass
+
+
+StatusTrigger: TypeAlias = OnDamageTaken | OnDamageDealt | OnTurnStart | OnTurnEnd
+
+
+@dataclass(eq=True, frozen=True)
+class ModifyAmount:
+    expr: str
+    condition: str | None = None
+    consumes_counter: bool = False
+
+
+@dataclass(eq=True, frozen=True)
+class DealDamageToSelf:
+    amount: float
+
+
+@dataclass(eq=True, frozen=True)
+class GainBlockReaction:
+    amount: float
+
+
+@dataclass(eq=True, frozen=True)
+class Advisory:
+    description: str
+
+
+StatusReaction: TypeAlias = (
+    ModifyAmount | DealDamageToSelf | GainBlockReaction | Advisory
+)
+
+
 @dataclass
 class StatusDefinition:
     name: str
-    subst: Subst
+    trigger: StatusTrigger | None
+    reaction: StatusReaction
     counter_type: Literal["turns", "times"]
 
     description: str = ""
@@ -50,6 +104,7 @@ class SinglePointEffect(BaseEffect):
     delta_hp: int = 0
     add_status: tuple[StatusDefinition, int] | None = None
     remove_status: str | None = None
+    source: str | None = None
 
     @staticmethod
     def from_damage(damage: int, pierce: bool = False) -> SinglePointEffect:
@@ -147,6 +202,169 @@ class ParseEffectError(ValueError):
     ...
 
 
+class UnsafeStatusExpression(ValueError):
+    ...
+
+
+_ALLOWED_EXPR_NAMES = {"amount", "counter"}
+_ALLOWED_EXPR_CALLS = {"min": min, "max": max}
+
+
+def _validate_status_expr_node(node: ast.AST, allow_compare: bool = False) -> None:
+    match node:
+        case ast.Expression(body=body):
+            _validate_status_expr_node(body, allow_compare)
+        case ast.Constant(value=value) if isinstance(value, int | float | bool):
+            return
+        case ast.Name(id=name) if name in _ALLOWED_EXPR_NAMES:
+            return
+        case ast.BinOp(left=left, op=op, right=right) if isinstance(
+            op, ast.Add | ast.Sub | ast.Mult | ast.Div | ast.FloorDiv
+        ):
+            _validate_status_expr_node(left, allow_compare)
+            _validate_status_expr_node(right, allow_compare)
+        case ast.UnaryOp(op=op, operand=operand) if isinstance(op, ast.UAdd | ast.USub):
+            _validate_status_expr_node(operand, allow_compare)
+        case ast.Call(func=ast.Name(id=name), args=args, keywords=[]) if name in _ALLOWED_EXPR_CALLS:
+            for arg in args:
+                _validate_status_expr_node(arg, allow_compare)
+        case ast.Compare(left=left, ops=ops, comparators=comparators) if allow_compare:
+            if not all(
+                isinstance(op, ast.Eq | ast.NotEq | ast.Lt | ast.LtE | ast.Gt | ast.GtE)
+                for op in ops
+            ):
+                raise UnsafeStatusExpression(
+                    f"Unsafe status comparison: {ast.dump(node)}"
+                )
+            _validate_status_expr_node(left, allow_compare)
+            for comparator in comparators:
+                _validate_status_expr_node(comparator, allow_compare)
+        case ast.BoolOp(values=values) if allow_compare:
+            for value in values:
+                _validate_status_expr_node(value, allow_compare)
+        case _:
+            raise UnsafeStatusExpression(f"Unsafe status expression: {ast.dump(node)}")
+
+
+def evaluate_status_expr(expr: str, *, amount: float, counter: int) -> float:
+    tree = ast.parse(expr, mode="eval")
+    _validate_status_expr_node(tree)
+    return eval(
+        compile(tree, "<status-expression>", "eval"),
+        {"__builtins__": {}, **_ALLOWED_EXPR_CALLS},
+        {"amount": amount, "counter": counter},
+    )
+
+
+def evaluate_status_condition(
+    condition: str | None, *, amount: float, counter: int
+) -> bool:
+    if condition is None:
+        return True
+    tree = ast.parse(condition, mode="eval")
+    _validate_status_expr_node(tree, allow_compare=True)
+    return bool(
+        eval(
+            compile(tree, "<status-condition>", "eval"),
+            {"__builtins__": {}, **_ALLOWED_EXPR_CALLS},
+            {"amount": amount, "counter": counter},
+        )
+    )
+
+
+def _legacy_expr_to_status_expr(expr: str, amount_match_index: int) -> str:
+    expr = expr.strip()
+    if expr.startswith("{{") and expr.endswith("}}"):
+        expr = expr[2:-2].strip()
+    expr = expr.replace(f"m[{amount_match_index}]", "amount")
+    expr = expr.replace("m[0]", "amount" if amount_match_index == 0 else "0")
+    expr = expr.replace("m[1]", "amount" if amount_match_index == 1 else "0")
+    return expr
+
+
+def _parse_legacy_damage_expr(replacement: str) -> str | None:
+    match = re.search(r"damaged\s+(.+?)(?:\s+by\s+.*)?\]$", replacement)
+    if not match:
+        return None
+    return match.group(1).strip()
+
+
+def _parse_legacy_flat_status(
+    name: str, counter_type: Literal["turns", "times"], rule: str
+) -> StatusDefinition:
+    return StatusDefinition(
+        name=name,
+        trigger=None,
+        reaction=Advisory(rule),
+        counter_type=counter_type,
+        description=rule,
+    )
+
+
+def status_definition_from_legacy(
+    name: str,
+    counter_type: Literal["turns", "times"],
+    rule: str,
+) -> StatusDefinition:
+    match = re.match(
+        r"(?P<trigger>\[.*?\])\s*(?:if\s+(?P<condition>.*?)\s*)?->\s*(?P<replacement>\[.*\])$",
+        rule.strip(),
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        logger.warning("Unmapped legacy status rule", name=name, rule=rule)
+        return _parse_legacy_flat_status(name, counter_type, rule)
+
+    trigger_text = match.group("trigger").strip()
+    condition = match.group("condition")
+    replacement = match.group("replacement").strip()
+    trigger_lower = trigger_text.lower()
+    replacement_lower = replacement.lower()
+
+    if "end of turn" in trigger_lower:
+        if damage_expr := _parse_legacy_damage_expr(replacement_lower):
+            try:
+                amount = evaluate_status_expr(damage_expr, amount=0, counter=0)
+            except UnsafeStatusExpression:
+                logger.warning("Unmapped legacy end-of-turn status", name=name, rule=rule)
+                return _parse_legacy_flat_status(name, counter_type, rule)
+            return StatusDefinition(
+                name=name,
+                trigger=OnTurnEnd(),
+                reaction=DealDamageToSelf(amount),
+                counter_type=counter_type,
+            )
+        logger.warning("Unmapped legacy end-of-turn status", name=name, rule=rule)
+        return _parse_legacy_flat_status(name, counter_type, rule)
+
+    if "damaged {:d}" in trigger_lower:
+        is_dealt = " by me" in trigger_lower
+        amount_match_index = 1 if is_dealt else 0
+        damage_expr = _parse_legacy_damage_expr(replacement_lower)
+        if damage_expr is None:
+            logger.warning("Unmapped legacy damage status", name=name, rule=rule)
+            return _parse_legacy_flat_status(name, counter_type, rule)
+        expr = _legacy_expr_to_status_expr(damage_expr, amount_match_index)
+        condition = (
+            _legacy_expr_to_status_expr(condition, amount_match_index)
+            if condition
+            else None
+        )
+        return StatusDefinition(
+            name=name,
+            trigger=OnDamageDealt() if is_dealt else OnDamageTaken(),
+            reaction=ModifyAmount(
+                expr=expr,
+                condition=condition,
+                consumes_counter=counter_type == "times",
+            ),
+            counter_type=counter_type,
+        )
+
+    logger.warning("Unmapped legacy status rule", name=name, rule=rule)
+    return _parse_legacy_flat_status(name, counter_type, rule)
+
+
 def extract_tokens(pattern: str, haystack: str) -> tuple[str, ...]:
     match = search(pattern, haystack)
     if not match:
@@ -235,8 +453,7 @@ def parse_targeted_effect(
         entity, name, counter, counter_type, effects = match.fixed
         tokens = effects.split("|")
         common_modifiers = parse_common_modifiers(tokens[1:])
-        subst = tokens[0]
-        status_def = StatusDefinition(name, Subst.parse(subst + ";"), counter_type)
+        status_def = status_definition_from_legacy(name, counter_type, tokens[0])
         return entity, SinglePointEffect(
             add_status=(status_def, counter), **common_modifiers
         )
@@ -252,19 +469,26 @@ def parse_targeted_effect(
 
     delta_shield = 0
     delta_hp = 0
+    source = None
 
     for effect in effects:
         effect = effect.strip()
         if "shield" in effect:
             delta_shield = float(effect.split(" ")[1])
         elif "damaged" in effect or "healed" in effect:
-            delta_hp = float(effect.split(" ")[1])
+            effect_tokens = effect.split(" ")
+            delta_hp = float(effect_tokens[1])
             if "damaged" in effect:
                 delta_hp *= -1
+            if " by " in effect:
+                source = effect.split(" by ", 1)[1].strip()
 
     common_modifiers = parse_common_modifiers(effects)
     return entity, SinglePointEffect(
-        delta_shield=delta_shield, delta_hp=delta_hp, **common_modifiers
+        delta_shield=delta_shield,
+        delta_hp=delta_hp,
+        source=source,
+        **common_modifiers,
     )
 
 

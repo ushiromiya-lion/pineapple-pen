@@ -177,7 +177,9 @@ def command_from_targeted_effect(
     if effect.remove_status:
         return RemoveStatus(target=target, status_name=effect.remove_status, **modifiers)
     if effect.delta_hp < 0:
-        return DealDamage(target=target, amount=-effect.delta_hp, **modifiers)
+        return DealDamage(
+            target=target, amount=-effect.delta_hp, source=effect.source, **modifiers
+        )
     if effect.delta_hp > 0:
         return Heal(target=target, amount=effect.delta_hp, **modifiers)
     if effect.delta_shield > 0:
@@ -234,7 +236,9 @@ def effect_from_command(command: BattleCommand, context: CardContext) -> Effect:
     modifiers = _modifiers_from_command(command)
     match command:
         case DealDamage(target=target, amount=amount):
-            return target, SinglePointEffect(delta_hp=-amount, **modifiers)
+            return target, SinglePointEffect(
+                delta_hp=-amount, source=command.source, **modifiers
+            )
         case Heal(target=target, amount=amount):
             return target, SinglePointEffect(delta_hp=amount, **modifiers)
         case GainBlock(target=target, amount=amount):

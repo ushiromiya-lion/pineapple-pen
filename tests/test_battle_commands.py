@@ -25,10 +25,11 @@ from genio.card import Card
 from genio.effect import (
     CreateCardEffect,
     DiscardCardsEffect,
+    ModifyAmount,
+    OnDamageTaken,
     SinglePointEffect,
     StatusDefinition,
 )
-from genio.subst import Subst
 
 
 def make_bundle() -> BattleBundle:
@@ -41,10 +42,11 @@ def make_bundle() -> BattleBundle:
 
 def vulnerable_status() -> StatusDefinition:
     return StatusDefinition(
-        "vulnerable",
-        Subst.parse("[ME: damaged {:d}] -> [ME: damaged {{m[0] * 1.5}}];"),
-        "turns",
-        "Takes more damage.",
+        name="vulnerable",
+        trigger=OnDamageTaken(),
+        reaction=ModifyAmount(expr="amount * 1.5"),
+        counter_type="turns",
+        description="Takes more damage.",
     )
 
 
