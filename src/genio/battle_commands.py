@@ -81,6 +81,7 @@ class DiscardCards(CommandModifiers):
 class CreateCard(CommandModifiers):
     name: str = ""
     description: str | None = None
+    energy_cost: int = 1
     copies: int = 1
     where: Literal["deck_top", "deck", "hand", "graveyard"] = "hand"
 
@@ -97,6 +98,7 @@ class TransformCard(CommandModifiers):
     card_id: str = ""
     name: str = ""
     description: str | None = None
+    energy_cost: int | None = None
 
 
 @dataclass(frozen=True)
@@ -226,6 +228,7 @@ def command_from_global_effect(effect: GlobalEffect) -> BattleCommand:
             return CreateCard(
                 name=create.card.name,
                 description=create.card.description,
+                energy_cost=create.card.energy_cost,
                 copies=create.copies,
                 where=create.where,
                 **modifiers,
@@ -242,6 +245,7 @@ def command_from_global_effect(effect: GlobalEffect) -> BattleCommand:
                 card_id=transform.from_card.short_id(),
                 name=transform.to_card.name,
                 description=transform.to_card.description,
+                energy_cost=transform.to_card.energy_cost,
                 **modifiers,
             )
         case DestroyCardEffect(_) as destroy:
@@ -283,9 +287,19 @@ def effect_from_command(command: BattleCommand, context: CardContext) -> Effect:
                 specifics=[context.seek_card(card_id) for card_id in card_ids],
                 **modifiers,
             )
-        case CreateCard(name=name, description=description, copies=copies, where=where):
+        case CreateCard(
+            name=name,
+            description=description,
+            energy_cost=energy_cost,
+            copies=copies,
+            where=where,
+        ):
             return CreateCardEffect(
-                card=Card(name=name, description=description),
+                card=Card(
+                    name=name,
+                    description=description,
+                    energy_cost=max(0, int(energy_cost)),
+                ),
                 copies=copies,
                 where=where,
                 **modifiers,
@@ -297,10 +311,24 @@ def effect_from_command(command: BattleCommand, context: CardContext) -> Effect:
                 where=where,
                 **modifiers,
             )
-        case TransformCard(card_id=card_id, name=name, description=description):
+        case TransformCard(
+            card_id=card_id,
+            name=name,
+            description=description,
+            energy_cost=energy_cost,
+        ):
+            from_card = context.seek_card(card_id)
             return TransformCardEffect(
-                from_card=context.seek_card(card_id),
-                to_card=Card(name=name, description=description),
+                from_card=from_card,
+                to_card=Card(
+                    name=name,
+                    description=description,
+                    energy_cost=(
+                        from_card.energy_cost
+                        if energy_cost is None
+                        else max(0, int(energy_cost))
+                    ),
+                ),
                 **modifiers,
             )
         case DestroyCard(card_ids=card_ids):

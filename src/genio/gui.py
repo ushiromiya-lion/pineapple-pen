@@ -4,6 +4,7 @@ import contextlib
 import functools
 import itertools
 import math
+import textwrap
 from collections import deque
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -16,6 +17,7 @@ import pytweening
 import pyxel
 from pyxelxl import blt_rot, layout
 from pyxelxl.font import _image_as_ndarray
+from structlog import get_logger
 
 from genio.base import Video, asset_path, load_image, resize_image_breathing
 from genio.battle import (
@@ -76,13 +78,13 @@ from genio.ps import Anim
 from genio.scene import EmitSound, Scene, emit_sound_event
 from genio.sound_events import SoundEv
 from genio.stagegen import (
-    GenerateLetterReplacementResult,
-    GeneratePrefixCardResult,
-    generate_letter_replacement_description,
-    generate_prefix_card_description,
+    GenerateNamedCardResult,
+    generate_named_card_description,
 )
 from genio.tween import Instant, MutableTweening, Mutator, Shake, Tweener
 from genio.utils.weaklist import WeakList
+
+logger = get_logger()
 
 
 def round_off_rating(number):
@@ -454,7 +456,11 @@ class CardSprite:
                     Mutator(10, pytweening.easeInOutQuad, self, "rotation", 0),
                 )
             self.hovered = True
-            self.app.tooltip.pump_energy(self.card.name, self.card.description or "")
+            self.app.tooltip.pump_energy(
+                self.card.name,
+                self.card.description or "",
+                self.card.flavor_text or "",
+            )
         else:
             if self.hovered:
                 self.tweens.clear()
@@ -540,13 +546,20 @@ def horizontal_gradient(x, y, w, h, c0, c1):
 class Tooltip:
     """The help box."""
 
-    def __init__(self, title: str = "", description: str = "") -> None:
+    def __init__(
+        self, title: str = "", description: str = "", flavor_text: str = ""
+    ) -> None:
         self.title = title
         self.description = description
+        self.flavor_text = flavor_text
         self.counter = 60
 
     def draw(self) -> None:
-        if (not self.title and not self.description) or self.counter <= 0:
+        if (
+            not self.title
+            and not self.description
+            and not self.flavor_text
+        ) or self.counter <= 0:
             return
         mx, my = pyxel.mouse_x, pyxel.mouse_y
         amx, amy = mx, my
@@ -556,12 +569,27 @@ class Tooltip:
         dither_amount = 1.0 if self.counter > 50 else (self.counter / 50) ** 2
         rect_width = 80
         rect_height = 15
-        if self.description:
-            rect_width *= 2
-            rect_height *= 2 if not game_state.should_use_large_font() else 2.5
-            rect_height = int(rect_height)
-        if len(self.description) > 50:
-            rect_height += 17
+        rules_width = 144 if self.flavor_text else 160
+        flavor_width = 74 if self.flavor_text else 0
+        if self.description or self.flavor_text:
+            rect_width = rules_width + flavor_width + 16
+            rules_wrap_width = 30 if self.flavor_text else 34
+            if game_state.should_use_large_font():
+                rules_wrap_width = 24 if self.flavor_text else 28
+            flavor_wrap_width = 18
+            line_count = self._wrapped_line_count(
+                self.description, rules_wrap_width
+            )
+            if self.flavor_text:
+                line_count = max(
+                    line_count,
+                    self._wrapped_line_count(self.flavor_text, flavor_wrap_width),
+                )
+            line_height = 7 if not game_state.should_use_large_font() else 9
+            rect_height = 18 + line_count * line_height
+            rect_height = max(
+                rect_height, 30 if not game_state.should_use_large_font() else 38
+            )
         draw_mixed_rounded_rect(dither_amount, amx, amy, w=rect_width, h=rect_height)
         with dithering(dither_amount):
             cute_text(
@@ -584,26 +612,64 @@ class Tooltip:
                     self.description,
                     7,
                     layout=layout(
-                        w=rect_width - 16, ha="left", va="top", h=rect_height - 11
+                        w=rules_width - 8,
+                        ha="left",
+                        va="top",
+                        h=rect_height - 11,
                     ),
                 )
+            if self.flavor_text:
+                pyxel.line(
+                    amx - rect_width // 2 + rules_width + 3,
+                    amy + 15,
+                    amx - rect_width // 2 + rules_width + 3,
+                    amy + rect_height - 5,
+                    5,
+                )
+                retro_text(
+                    amx - rect_width // 2 + rules_width + 8,
+                    amy + 15,
+                    self.flavor_text,
+                    5,
+                    layout=layout(
+                        w=flavor_width,
+                        ha="left",
+                        va="top",
+                        h=rect_height - 17,
+                    ),
+                )
+
+    @staticmethod
+    def _wrapped_line_count(text: str, wrap_width: int) -> int:
+        if not text:
+            return 0
+        return sum(
+            max(1, len(textwrap.wrap(paragraph, wrap_width)))
+            for paragraph in text.splitlines()
+        )
 
     def update(self) -> None:
         self.counter -= 3
         if self.counter <= 0:
             self.title = ""
             self.description = ""
+            self.flavor_text = ""
             self.counter = 0
 
-    def pump_energy(self, title: str, description: str) -> None:
+    def pump_energy(
+        self, title: str, description: str, flavor_text: str = ""
+    ) -> None:
         if self.counter >= 40 and (
-            self.title != title or self.description != description
+            self.title != title
+            or self.description != description
+            or self.flavor_text != flavor_text
         ):
             return
         self.counter += 10
         self.counter = min(60, self.counter)
         self.title = title
         self.description = description
+        self.flavor_text = flavor_text
 
 
 class FlashState:
@@ -1165,11 +1231,9 @@ class MainScene(Scene):
             s.y = 60
 
         self.futures: deque[tuple[Future[ResolvedEffects], bool]] = deque()
-        self.prefix_futures: deque[
-            tuple[Future[GeneratePrefixCardResult], str]
-        ] = deque()
+        self.prefix_futures: deque[tuple[Future[GenerateNamedCardResult], str]] = deque()
         self.letter_replacement_futures: deque[
-            tuple[Future[GenerateLetterReplacementResult], str]
+            tuple[Future[GenerateNamedCardResult], str]
         ] = deque()
         self.letter_replacer_card: Card | None = None
         self.letter_replacer_target_id: str | None = None
@@ -1556,6 +1620,53 @@ class MainScene(Scene):
         for card_sprite in self.card_sprites:
             card_sprite.selected = False
 
+    def named_card_hand_context(self) -> list[str]:
+        hand = []
+        for card in self.bundle.card_bundle.hand:
+            text = f"[cost {card.energy_cost}] {card.to_plaintext()}"
+            if card.flavor_text:
+                text += f' "{card.flavor_text}"'
+            hand.append(text)
+        return hand
+
+    def named_card_combat_context(self) -> str:
+        player = self.bundle.player
+        lines = [
+            f"Turn {self.bundle.turn_counter + 1}. Energy: {self.bundle.energy}/{self.bundle.default_energy}.",
+            (
+                f"{player.name}: {player.hp}/{player.max_hp} HP, "
+                f"{player.shield_points} Block."
+            ),
+        ]
+        for enemy in self.bundle.enemies:
+            lines.append(
+                f"{enemy.name}: {enemy.hp}/{enemy.max_hp} HP, "
+                f"{enemy.shield_points} Block, intent: {enemy.current_intent}. "
+                f"{enemy.description}"
+            )
+        if statuses := self.bundle.status_snapshot_text():
+            lines.append("Statuses:\n" + statuses)
+        return "\n".join(lines)
+
+    def submit_named_card_generation(
+        self,
+        card: Card,
+        previous_name: str | None = None,
+        previous_description: str | None = None,
+    ) -> Future[GenerateNamedCardResult]:
+        return self.executor.submit(
+            generate_named_card_description,
+            card.name,
+            card_energy_cost(card),
+            card.rarity,
+            self.bundle.player.profile.profile,
+            self.named_card_combat_context(),
+            self.named_card_hand_context(),
+            card.prefix_role,
+            previous_name,
+            previous_description,
+        )
+
     def confirm_letter_replacement(
         self, target_sprite: CardSprite, letter_index: int, new_letter: str
     ) -> None:
@@ -1570,14 +1681,10 @@ class MainScene(Scene):
         self.framing.putup()
         self.letter_replacement_futures.append(
             (
-                self.executor.submit(
-                    generate_letter_replacement_description,
-                    original_name,
-                    original_description,
-                    new_name,
-                    self.bundle.player.name_stem,
-                    card_energy_cost(target),
-                    target.rarity,
+                self.submit_named_card_generation(
+                    target,
+                    previous_name=original_name,
+                    previous_description=original_description,
                 ),
                 target.id,
             )
@@ -1647,6 +1754,7 @@ class MainScene(Scene):
             try:
                 effects = future.result()
             except Exception:
+                logger.exception("No signal resolving played card")
                 effects = ResolvedEffects([], rarity=1)
                 self.add_popup("No signal", WINDOW_WIDTH // 2 - 20, 112, 8)
             self.on_receive_mail(effects, used_framing)
@@ -1655,12 +1763,18 @@ class MainScene(Scene):
         while self.prefix_futures and self.prefix_futures[0][0].done():
             future, card_id = self.prefix_futures.popleft()
             try:
-                description = future.result().description
+                result = future.result()
+                description = result.description
+                flavor_text = result.flavor_text
+                energy_cost = result.energy_cost
             except Exception:
+                logger.exception("No signal generating prefix card")
                 description = "Deal 6 damage."
+                flavor_text = None
+                energy_cost = 1
                 self.add_popup("No signal", WINDOW_WIDTH // 2 - 20, 112, 8)
             card = self.card_by_id(card_id)
-            card.finish_prefix_description(description)
+            card.finish_prefix_description(description, flavor_text, energy_cost)
             for card_sprite in self.card_sprites:
                 if card_sprite.card.id == card_id:
                     card_sprite.selected = False
@@ -1676,15 +1790,23 @@ class MainScene(Scene):
         ):
             future, card_id = self.letter_replacement_futures.popleft()
             try:
-                description = future.result().description
+                result = future.result()
+                description = result.description
+                flavor_text = result.flavor_text
+                energy_cost = result.energy_cost
             except Exception:
+                logger.exception("No signal generating renamed card")
                 description = "Deal 6 damage."
+                flavor_text = None
+                energy_cost = 1
                 self.add_popup("No signal", WINDOW_WIDTH // 2 - 20, 112, 8)
             card = self.card_by_id(card_id)
             card.begin_temporary_transform(
                 card.name,
                 description,
+                flavor_text=flavor_text,
                 card_art_name=card.card_art_name,
+                energy_cost=energy_cost,
             )
             for card_sprite in self.card_sprites:
                 if card_sprite.card.id == card_id:
@@ -1745,14 +1867,7 @@ class MainScene(Scene):
                 self.framing.putup()
                 self.prefix_futures.append(
                     (
-                        self.executor.submit(
-                            generate_prefix_card_description,
-                            card.name,
-                            self.bundle.player.name_stem,
-                            card_energy_cost(card),
-                            card.rarity,
-                            card.prefix_role,
-                        ),
+                        self.submit_named_card_generation(card),
                         card.id,
                     )
                 )

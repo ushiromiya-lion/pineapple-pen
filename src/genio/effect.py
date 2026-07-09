@@ -518,6 +518,7 @@ def parse_global_effect(modifier: str, context: CardContext) -> GlobalEffect:
         to_card_desc = f"<{to_card}>"
         from_card = context.seek_card(from_card)
         to_card = Card.parse(to_card_desc)
+        to_card.energy_cost = from_card.energy_cost
         return TransformCardEffect(from_card=from_card, to_card=to_card)
     elif "create" in effect[:20]:
         card_desc, postfix, where = extract_tokens("[create <{}>{}in {:w}", modifier)

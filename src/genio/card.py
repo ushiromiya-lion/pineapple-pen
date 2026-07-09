@@ -29,6 +29,7 @@ def judge_is_flashcard_like(card_description: str | None) -> bool:
 class Card:
     name: str = ""
     description: str | None = None
+    flavor_text: str | None = None
     id: str = field(default_factory=lambda: str(uuid.uuid4()))
 
     card_art_name: str | None = None
@@ -41,23 +42,35 @@ class Card:
     prefix_length: int | None = None
     prefix_typed: str = ""
     prefix_pending: bool = False
-    energy_cost: int | None = None
+    energy_cost: int = 1
     rarity: str = "common"
     temporary_original_name: str | None = None
     temporary_original_description: str | None = None
+    temporary_original_flavor_text: str | None = None
     temporary_original_card_art_name: str | None = None
+    temporary_original_energy_cost: int | None = None
 
     def to_record(self) -> dict:
         return {
             "id": self.id,
             "name": self.name,
             "description": self.description,
+            "flavor_text": self.flavor_text,
+            "energy_cost": self.energy_cost,
         }
 
     def to_plaintext(self) -> str:
         if self.description:
             return f"<{self.name}: {self.description}>"
         return f"<{self.name}>"
+
+    def display_description(self) -> str:
+        parts = []
+        if self.description:
+            parts.append(self.description)
+        if self.flavor_text:
+            parts.append(f'"{self.flavor_text}"')
+        return "\n".join(parts)
 
     def short_id(self) -> str:
         return b32encode(bytes.fromhex(self.id[:8])).decode().lower()[:4]
@@ -76,6 +89,7 @@ class Card:
         return Card(
             name=self.name,
             description=self.description,
+            flavor_text=self.flavor_text,
             card_art_name=self.card_art_name,
             prefix=self.prefix,
             prefix_template=self.prefix_template,
@@ -94,25 +108,37 @@ class Card:
         self,
         name: str,
         description: str | None,
+        flavor_text: str | None = None,
         card_art_name: str | None = None,
+        energy_cost: int | None = None,
     ) -> None:
         if self.temporary_original_name is None:
             self.temporary_original_name = self.name
             self.temporary_original_description = self.description
+            self.temporary_original_flavor_text = self.flavor_text
             self.temporary_original_card_art_name = self.card_art_name
+            self.temporary_original_energy_cost = self.energy_cost
         self.name = name
         self.description = description
+        self.flavor_text = flavor_text
         self.card_art_name = card_art_name
+        if energy_cost is not None:
+            self.energy_cost = energy_cost
 
     def revert_temporary_transform(self) -> None:
         if self.temporary_original_name is None:
             return
         self.name = self.temporary_original_name
         self.description = self.temporary_original_description
+        self.flavor_text = self.temporary_original_flavor_text
         self.card_art_name = self.temporary_original_card_art_name
+        if self.temporary_original_energy_cost is not None:
+            self.energy_cost = self.temporary_original_energy_cost
         self.temporary_original_name = None
         self.temporary_original_description = None
+        self.temporary_original_flavor_text = None
         self.temporary_original_card_art_name = None
+        self.temporary_original_energy_cost = None
 
     def has_temporary_transform(self) -> bool:
         return self.temporary_original_name is not None
@@ -202,6 +228,7 @@ class Card:
             self.prefix_typed = ""
             self.prefix_pending = False
             self.description = None
+            self.flavor_text = None
             self.name = self._format_template_name(self.prefix_draw_template)
             return
         prefix = self.prefix or ""
@@ -209,6 +236,7 @@ class Card:
         self.prefix_typed = ""
         self.prefix_pending = False
         self.description = None
+        self.flavor_text = None
         self.name = prefix + "_" * self.prefix_suffix_length()
 
     def set_prefix_suffix(self, suffix: str) -> None:
@@ -219,11 +247,13 @@ class Card:
         if self.prefix_template is not None:
             self.name = self._format_template_name(self._render_template_word())
             self.description = None
+            self.flavor_text = None
             self.prefix_pending = False
             return
         remaining = self.prefix_suffix_length() - len(self.prefix_typed)
         self.name = f"{self.prefix}{self.prefix_typed}{'_' * remaining}"
         self.description = None
+        self.flavor_text = None
         self.prefix_pending = False
 
     def append_prefix_letter(self, letter: str) -> None:
@@ -246,12 +276,21 @@ class Card:
             word = f"{self.prefix}{self.prefix_typed}"
         self.name = word[:1].upper() + word[1:].lower()
         self.description = None
+        self.flavor_text = None
         self.prefix_pending = True
 
-    def finish_prefix_description(self, description: str) -> None:
+    def finish_prefix_description(
+        self,
+        description: str,
+        flavor_text: str | None = None,
+        energy_cost: int | None = None,
+    ) -> None:
         if not self.is_prefix_card():
             return
         self.description = description
+        self.flavor_text = flavor_text
+        if energy_cost is not None:
+            self.energy_cost = energy_cost
         self.prefix_pending = False
 
     def __hash__(self) -> int:

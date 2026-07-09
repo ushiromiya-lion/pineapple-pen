@@ -51,7 +51,8 @@ def test_discrete_card_energy_costs():
     assert calculate_energy_cost([Card("Bash")]) == 1
     assert calculate_energy_cost([Card("Bind")]) == 1
     assert calculate_energy_cost([Card("Dash", energy_cost=1)]) == 1
-    assert calculate_energy_cost([Card("Letter Replacer")]) == 0
+    assert calculate_energy_cost([Card("Letter Replacer")]) == 1
+    assert calculate_energy_cost([Card("Letter Replacer", energy_cost=0)]) == 0
     assert calculate_energy_cost([Card("Strike"), Card("Bash")]) == 2
 
 

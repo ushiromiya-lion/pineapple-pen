@@ -4,6 +4,7 @@ hit_points = 80
 mp = 6
 profile = """
 Typist fights by finishing half-seen words into sudden spells. Their deck turns letters into intent, and intent into impact.
+They fight through words, letters, typing, typos, word length, prefixes, suffixes, letter replacement, shuffling letters, repeated words, long words, short words, specific letters, terminal-like commands, puns, and wordplay.
 """
 
 

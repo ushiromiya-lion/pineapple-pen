@@ -197,6 +197,7 @@ def _tool_declarations() -> list[types.FunctionDeclaration]:
             {
                 "name": _s("STRING", "New card name."),
                 "description": _s("STRING", "New card description."),
+                "energy_cost": _s("INTEGER", "Explicit energy cost.", minimum=0, maximum=9),
                 "copies": _s("INTEGER", "Copies.", minimum=1, maximum=3),
                 "where": WHERE,
             },
@@ -219,6 +220,12 @@ def _tool_declarations() -> list[types.FunctionDeclaration]:
                 "card_id": _s("STRING", "Exact card id."),
                 "name": _s("STRING", "New card name."),
                 "description": _s("STRING", "New card description."),
+                "energy_cost": _s(
+                    "INTEGER",
+                    "Explicit energy cost. Omit to preserve the transformed card's cost.",
+                    minimum=0,
+                    maximum=9,
+                ),
             },
             ["card_id", "name", "description"],
         ),
@@ -620,6 +627,7 @@ class BattleToolHarness:
         command = CreateCard(
             name=str(self._req(args, "name")),
             description=str(self._req(args, "description")),
+            energy_cost=self._int(args, "energy_cost", 0, 9, default=1),
             copies=self._int(args, "copies", 1, 3, default=1),
             where=self._where(args),
         )
@@ -642,6 +650,11 @@ class BattleToolHarness:
             card_id=card.short_id(),
             name=str(self._req(args, "name")),
             description=str(self._req(args, "description")),
+            energy_cost=(
+                self._int(args, "energy_cost", 0, 9)
+                if args.get("energy_cost") is not None
+                else None
+            ),
         )
         self._stage(command, None)
         return self._echo(command)

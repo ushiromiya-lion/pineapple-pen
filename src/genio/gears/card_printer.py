@@ -76,42 +76,58 @@ class CardPrinter:
         card_name = card.card_art_name or card.name
         match card_name:
             case "3 of Spades":
-                return load_image("cards", "three-of-spades.png")
+                return self.with_cost_badge(
+                    copy_image(load_image("cards", "three-of-spades.png")),
+                    card.energy_cost,
+                )
             case "6 of Hearts":
-                return load_image("cards", "six-of-hearts.png")
+                return self.with_cost_badge(
+                    copy_image(load_image("cards", "six-of-hearts.png")),
+                    card.energy_cost,
+                )
             case "4 of Diamonds":
-                return load_image("cards", "four-of-diamonds.png")
+                return self.with_cost_badge(
+                    copy_image(load_image("cards", "four-of-diamonds.png")),
+                    card.energy_cost,
+                )
             case "4 of Spades":
-                return load_image("cards", "four-of-spades.png")
+                return self.with_cost_badge(
+                    copy_image(load_image("cards", "four-of-spades.png")),
+                    card.energy_cost,
+                )
             case "The Fool":
                 image = copy_image(load_image("cards", "the-fool.png"))
-                return image
+                return self.with_cost_badge(image, card.energy_cost)
             case "The Emperor":
                 image = copy_image(load_image("cards", "the-emperor.png"))
-                return image
+                return self.with_cost_badge(image, card.energy_cost)
             case "Block":
                 image = copy_image(load_image("cards", "block.png"))
-                return image
+                return self.with_cost_badge(image, card.energy_cost)
             case "Slash":
                 image = copy_image(load_image("cards", "slash.png"))
-                return image
+                return self.with_cost_badge(image, card.energy_cost)
             case "left":
                 image = copy_image(load_image("cards", "left.png"))
-                return image
+                return self.with_cost_badge(image, card.energy_cost)
             case "right":
                 image = copy_image(load_image("cards", "right.png"))
-                return image
+                return self.with_cost_badge(image, card.energy_cost)
             case "Smash":
                 image = copy_image(load_image("cards", "smash.png"))
-                return image
+                return self.with_cost_badge(image, card.energy_cost)
             case _:
                 return self._print_card(card)
+
+    def with_cost_badge(self, image: pyxel.Image, cost: int) -> pyxel.Image:
+        self.draw_cost_badge(image, cost)
+        return image
 
     def _print_card(self, card: Card) -> pyxel.Image:
         if card.is_flashcard_like():
             image = copy_image(load_image("card_flash.png"))
             self.add_flashcard_text_to_card(card.name, image)
-            return image
+            return self.with_cost_badge(image, card.energy_cost)
         image = copy_image(empty_card())
         background = self.spritesheet.search_image(card.card_art_name or card.name)
         return self.render_card_image(card, image, background)
@@ -136,7 +152,17 @@ class CardPrinter:
                     continue
                 rot180 = bool(rot180_i)
                 self.print_text(image, single_word, rot180)
+        self.draw_cost_badge(image, card.energy_cost)
         return image
+
+    def draw_cost_badge(self, image: pyxel.Image, cost: int) -> None:
+        label = str(max(0, int(cost)))
+        width = max(8, len(label) * 4 + 4)
+        x = CARD_WIDTH - width - 2
+        y = 2
+        image.rect(x, y, width, 8, 7)
+        image.rectb(x, y, width, 8, 0)
+        image.text(x + 3, y + 1, label, 0)
 
     def print_text(
         self, image: pyxel.Image, single_word: str, rot180: bool, bx: int = 2

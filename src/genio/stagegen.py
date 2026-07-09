@@ -101,75 +101,106 @@ class GenerateSTSCardResult(CardsLike):
 
 
 @dataclass
-class GeneratePrefixCardResult:
-    """A generated effect description for one completed card name."""
+class GenerateNamedCardResult:
+    """A generated rules text and optional flavor text for one named card."""
 
+    energy_cost: Annotated[
+        int,
+        (
+            "The explicit energy cost to print on the card and charge when played. "
+            "Usually close to the suggested cost, but can be 0 or higher if the "
+            "card name and effect call for it."
+        ),
+    ]
     description: Annotated[
         str,
         (
             "A concise Slay the Spire-style effect description for this card. "
-            "Do not include an energy cost."
+            "Do not include an energy cost in this text; use the energy_cost field."
         ),
     ]
+    flavor_text: Annotated[
+        str | None,
+        (
+            "Optional MTG-style flavor text that is specific to this card name, "
+            "the character, and the current situation. Use null if it does not fit."
+        ),
+    ] = None
 
 
 @promptly()
-def generate_prefix_card_description(
+def generate_named_card_description(
     card_name: str,
-    player_name: str,
     card_cost: int,
     card_rarity: str,
+    player_profile: str,
+    combat_context: str,
+    hand: list[str],
     card_role: str | None = None,
-) -> GeneratePrefixCardResult:
+    previous_name: str | None = None,
+    previous_description: str | None = None,
+) -> GenerateNamedCardResult:
     """\
-    Act as an excellent game designer.
+    Act as an imaginative card designer for a Slay-the-Spire-like roguelike.
 
-    {{ player_name }} completed a prefix card into "{{ card_name }}".
-    This is a Slay-the-Spire-like card game. Write only the effect text for a
-    card that feels roughly like a {{ card_cost }}-cost {{ card_rarity }} card.
+    A card has just been named "{{ card_name }}" during combat.
+    It starts from the neighborhood of a {{ card_cost }}-cost {{ card_rarity }}
+    card, but you must choose and return its exact energy_cost. The name matters:
+    if the name sounds strong, weak, clever, narrow, or situational, the card may
+    cost more or less to match. Do not make it game-breaking.
+
+    Character:
+    {{ player_profile }}
+
+    Current combat:
+    {{ combat_context }}
+
+    Current hand:
+    {% for card in hand %}
+    - {{ card }}
+    {% endfor %}
+
+    {% if previous_name %}
+    This card used to be "{{ previous_name }}":
+    {{ previous_description }}
+
+    Let the new name take over, while keeping some memory of the old card's role
+    or power level if it helps.
+    {% endif %}
+
+    Write the card rules text for "{{ card_name }}" and choose its exact cost.
+
+    The battle is interpreted by an LLM game master, so the effect can be
+    creative, contextual, referential, weird, or surprising. You are not limited
+    to ordinary engine primitives.
+
+    It is also fine, and often best, to make a straightforward old-fashioned
+    Slay-the-Spire-style card. Not every card needs to be about typing, letters,
+    the current enemy, or the current combat state. Treat the character profile
+    and combat context as inspiration, not requirements.
+
+    If "{{ card_name }}" is clearly a reference to another game, object, meme,
+    myth, event, person, place, command, or real-world concept, you may use that
+    reference's own logic. For example, a card named "Black Lotus" can say "Add
+    three black mana," even if this game does not normally use mana. The battle
+    GM will interpret what it means when played.
+
+    Occasionally reward clever situational wordplay. Only make the card care
+    about a specific enemy, status, intent, hand, or battle situation when the
+    name naturally and specifically points there. For example, if the enemy is a
+    chicken and the player names a card "Fry", the card can be devastating
+    specifically against that chicken.
+
     {% if card_role %}
     It came from a visible "{{ card_role }}" template.
     {% endif %}
-    If the word is strange or nonsense, interpret it playfully but keep it usable.
 
-    {{ formatting_instructions }}
-    """
+    Avoid overusing "if X, then Y" cards just to sound clever. Use conditions
+    when they are natural, but many cards should be direct.
 
-
-@dataclass
-class GenerateLetterReplacementResult:
-    """A rewritten effect description for a card whose title changed by one letter."""
-
-    description: Annotated[
-        str,
-        (
-            "A concise Slay the Spire-style effect description for the rewritten card. "
-            "Do not include an energy cost."
-        ),
-    ]
-
-
-@promptly()
-def generate_letter_replacement_description(
-    original_name: str,
-    original_description: str | None,
-    new_name: str,
-    player_name: str,
-    card_cost: int,
-    card_rarity: str,
-) -> GenerateLetterReplacementResult:
-    """\
-    Act as an excellent game designer.
-
-    {{ player_name }} used Letter Replacer to change "{{ original_name }}" into
-    "{{ new_name }}". Rewrite only the effect text for the new card. Preserve the
-    original card's rough power level. This is a Slay-the-Spire-like card game,
-    and the card should feel roughly like a {{ card_cost }}-cost {{ card_rarity }}
-    card. If the new title is strange or nonsense, interpret it playfully but
-    keep it usable.
-
-    Original effect:
-    {{ original_description }}
+    Make the card specific to its name. If the name is nonsense, find a strange
+    but playable association from its letters, sound, shape, typo-like quality,
+    or context.
 
     {{ formatting_instructions }}
     """

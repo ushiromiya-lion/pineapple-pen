@@ -120,6 +120,7 @@ def test_apply_card_zone_commands():
     assert bundle.card_bundle.has_card("shiv") == "hand"
 
     shiv = bundle.card_bundle.seek_card("shiv")
+    assert shiv.energy_cost == 1
     bundle.apply_commands([DuplicateCard(card_id=shiv.short_id(), copies=2)])
     assert bundle.card_bundle.count_cards("shiv") == 3
 
@@ -134,9 +135,23 @@ def test_apply_card_zone_commands():
     )
     assert shiv.name == "knife"
     assert shiv.description == "Deal 2 damage."
+    assert shiv.energy_cost == 1
+
+    bundle.apply_commands(
+        [
+            TransformCard(
+                card_id=shiv.short_id(),
+                name="free knife",
+                description="Deal 1 damage.",
+                energy_cost=0,
+            )
+        ]
+    )
+    assert shiv.name == "free knife"
+    assert shiv.energy_cost == 0
 
     bundle.apply_commands([DestroyCard(card_ids=(shiv.short_id(),))])
-    assert bundle.card_bundle.has_card("knife") is None
+    assert bundle.card_bundle.has_card("free knife") is None
 
 
 def test_apply_destroy_rule_command():

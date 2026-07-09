@@ -114,16 +114,31 @@ class CardRewardScene(Scene):
         self.draw_mouse_cursor(pyxel.mouse_x, pyxel.mouse_y)
 
     def draw_hover_text(self, card: Card) -> None:
-        draw_rounded_rectangle(96, 178, 236, 34, 3, 0)
+        has_flavor = bool(card.flavor_text)
+        description_width = 28 if has_flavor else 46
+        flavor_width = 18
+        description_lines = textwrap.wrap(card.description or "", description_width)
+        flavor_lines = (
+            textwrap.wrap(card.flavor_text or "", flavor_width) if has_flavor else []
+        )
+        line_count = max(len(description_lines), len(flavor_lines))
+        box_height = max(24, 14 + line_count * 7)
+        y = min(178, WINDOW_HEIGHT - box_height - 4)
+        draw_rounded_rectangle(96, y, 236, box_height, 3, 0)
         retro_text(
             102,
-            181,
+            y + 3,
             card.name,
             7,
             layout=layout(w=224, h=8, ha="center"),
         )
-        for i, line in enumerate(textwrap.wrap(card.description or "", 46)[:2]):
-            pyxel.text(102, 193 + i * 7, line, 7)
+        text_y = y + 15
+        for i, line in enumerate(description_lines):
+            pyxel.text(102, text_y + i * 7, line, 7)
+        if has_flavor:
+            pyxel.line(248, y + 15, 248, y + box_height - 5, 5)
+            for i, line in enumerate(flavor_lines):
+                pyxel.text(254, text_y + i * 7, line, 5)
 
     def request_next_scene(self) -> str | None:
         if self.next_scene_requested or self.next_scene is None:

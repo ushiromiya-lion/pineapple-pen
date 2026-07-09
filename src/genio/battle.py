@@ -14,7 +14,6 @@ from random import randint
 from typing import TYPE_CHECKING, Annotated, Generic, Literal
 
 import numpy as np
-import tiktoken
 from parse import parse, search
 from smallperm import sample, shuffle
 from structlog import get_logger
@@ -681,6 +680,8 @@ class CardBundle:
     def transform_card(self, from_card: Card, to_card: Card) -> None:
         from_card.name = to_card.name
         from_card.description = to_card.description
+        from_card.flavor_text = to_card.flavor_text
+        from_card.energy_cost = to_card.energy_cost
         self.events.append("transform_card", from_card.id)
 
     def revert_temporary_transforms(self) -> None:
@@ -1150,7 +1151,9 @@ class BattleBundle:
         request = (
             "The player plays the following cards, in order:\n"
             + "\n".join(
-                f"- {card.short_id()}: {card.name}: {card.description}" for card in cards
+                f"- {card.short_id()}: {card.name} "
+                f"(cost {card.energy_cost}): {card.description}"
+                for card in cards
             )
             + "\nResolve their effects with tool calls, then call finish_resolution."
         )
@@ -1636,15 +1639,6 @@ class MainSceneLike(CanAddAnim, Protocol):
         ...
 
 
-enc = tiktoken.get_encoding("o200k_base")
-
-
-def num_tokens(s: str | None) -> int:
-    if not s:
-        return 0
-    return len(enc.encode(s, allowed_special="all"))
-
-
 def calculate_energy_cost(cards: Sequence[Card]) -> int:
     return sum(card_energy_cost(card) for card in cards)
 
@@ -1660,8 +1654,4 @@ def card_can_resolve_without_llm(card: Card) -> bool:
 
 
 def card_energy_cost(card: Card) -> int:
-    if card.energy_cost is not None:
-        return card.energy_cost
-    if card.name.lower().rstrip("+") == "letter replacer":
-        return 0
-    return 1
+    return max(0, int(card.energy_cost))
