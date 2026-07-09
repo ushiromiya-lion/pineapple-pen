@@ -20,6 +20,7 @@ from pyxelxl.font import _image_as_ndarray
 from genio.base import Video, asset_path, load_image, resize_image_breathing
 from genio.battle import (
     BattleBundle,
+    Battler,
     CardBundle,
     EnemyBattler,
     MainSceneLike,
@@ -27,6 +28,7 @@ from genio.battle import (
 )
 from genio.battle_harness import (
     ChooseCardsRequest,
+    ChooseTargetsRequest,
     PlayerChoiceRequest,
 )
 from genio.card import Card
@@ -1072,6 +1074,8 @@ def _in_rect(x: int, y: int, w: int, h: int) -> bool:
 
 
 class PlayerChoiceOverlay:
+    CARD_PAGE_SIZE = 4
+
     def __init__(self, scene: MainScene, request: PlayerChoiceRequest) -> None:
         self.scene = scene
         self.request = request
@@ -1081,43 +1085,92 @@ class PlayerChoiceOverlay:
         self.reason_timer = 0
 
     @property
-    def options(self) -> list[Card] | list[EnemyBattler]:
+    def options(self) -> list[Card] | list[Battler]:
         if isinstance(self.request, ChooseCardsRequest):
             return self.request.cards
         return self.request.candidates
 
-    def _option_id(self, option: Card | EnemyBattler) -> str:
+    def _option_id(self, option: Card | Battler) -> str:
         if isinstance(option, Card):
             return option.short_id()
         return option.name
 
-    def _option_title(self, option: Card | EnemyBattler) -> str:
-        if isinstance(option, Card):
-            return option.name
-        return option.name
+    def _choice_kind(self) -> str:
+        if isinstance(self.request, ChooseTargetsRequest):
+            return "targets"
+        hand_ids = {card.short_id() for card in self.scene.bundle.card_bundle.hand}
+        option_ids = {card.short_id() for card in self.request.cards}
+        if option_ids and option_ids <= hand_ids:
+            return "hand"
+        return "browser"
 
-    def _visible_options(self) -> list[Card] | list[EnemyBattler]:
-        return self.options[self.page : self.page + 3]
-
-    def _slot_rect(self, index: int) -> tuple[int, int, int, int]:
-        return 68 + index * 100, 94, 88, 58
+    def _visible_cards(self) -> list[Card]:
+        if not isinstance(self.request, ChooseCardsRequest):
+            return []
+        return self.request.cards[self.page : self.page + self.CARD_PAGE_SIZE]
 
     def _confirm_rect(self) -> tuple[int, int, int, int]:
-        return 304, 172, 58, 16
+        return WINDOW_WIDTH - 90, WINDOW_HEIGHT - 27, 72, 17
 
     def _skip_rect(self) -> tuple[int, int, int, int]:
-        return 64, 172, 44, 16
+        return 18, WINDOW_HEIGHT - 27, 52, 17
 
     def _prev_rect(self) -> tuple[int, int, int, int]:
-        return 58, 126, 18, 18
+        return 16, 102, 18, 30
 
     def _next_rect(self) -> tuple[int, int, int, int]:
-        return 350, 126, 18, 18
+        return WINDOW_WIDTH - 34, 102, 18, 30
+
+    def _card_browser_rects(self) -> list[tuple[Card, int, int, int, int]]:
+        visible = self._visible_cards()
+        xs = layout_center_for_n(len(visible), WINDOW_WIDTH - 92)
+        y = 62
+        return [
+            (card, int(x - CARD_WIDTH // 2), y, CARD_WIDTH, CARD_HEIGHT)
+            for card, x in zip(visible, xs)
+        ]
+
+    def _hand_option_sprites(self) -> list[CardSprite]:
+        if not isinstance(self.request, ChooseCardsRequest):
+            return []
+        option_ids = {card.short_id() for card in self.request.cards}
+        return [
+            sprite
+            for sprite in self.scene.card_sprites
+            if sprite.card.short_id() in option_ids and sprite.state == CardState.ACTIVE
+        ]
+
+    def _target_sprite_rects(self) -> list[tuple[Battler, int, int, int, int]]:
+        rects = []
+        for sprite in self.scene.sprites():
+            candidate = next(
+                (
+                    candidate
+                    for candidate in self.request.candidates
+                    if candidate.uuid == sprite.user_data
+                    or candidate.name == sprite.user_data
+                ),
+                None,
+            )
+            if candidate is None:
+                continue
+            if isinstance(sprite, EnemyBattlerSprite):
+                x = int(sprite.x - 32)
+                y = int(sprite.y)
+                w = sprite.image.width
+                h = sprite.image.height
+            else:
+                x = int(sprite.x)
+                y = int(sprite.y)
+                w = int(sprite.width)
+                h = int(sprite.height)
+            rects.append((candidate, x, y, w, h))
+        return rects
 
     def selection_valid(self) -> bool:
         return self.request.min_count <= len(self.selected) <= self.request.max_count
 
-    def _toggle(self, option: Card | EnemyBattler) -> None:
+    def _toggle(self, option: Card | Battler) -> None:
         option_id = self._option_id(option)
         if option_id in self.selected:
             self.selected.remove(option_id)
@@ -1137,38 +1190,92 @@ class PlayerChoiceOverlay:
 
     def update(self) -> None:
         self.reason_timer += 1
-        if pyxel.btnp(pyxel.KEY_LEFT):
-            self.page = max(0, self.page - 3)
-        if pyxel.btnp(pyxel.KEY_RIGHT):
-            self.page = min(max(len(self.options) - 3, 0), self.page + 3)
-        for key, index in HAND_SELECT_KEYS[:3]:
-            if pyxel.btnp(key):
-                visible = self._visible_options()
-                if index < len(visible):
-                    self._toggle(visible[index])
+        if pyxel.btnr(pyxel.MOUSE_BUTTON_LEFT) and self._handle_footer_click():
+            return
+        kind = self._choice_kind()
+        if kind == "browser":
+            self._update_browser()
+        elif kind == "hand":
+            self._update_hand()
+        else:
+            self._update_targets()
+
         if pyxel.btnp(pyxel.KEY_RETURN) or pyxel.btnp(pyxel.KEY_KP_ENTER):
             self._submit()
         if self.request.min_count == 0 and pyxel.btnp(pyxel.KEY_ESCAPE):
             self.selected.clear()
             self._submit()
-        if not pyxel.btnr(pyxel.MOUSE_BUTTON_LEFT):
-            return
-        for index, option in enumerate(self._visible_options()):
-            if _in_rect(*self._slot_rect(index)):
-                self._toggle(option)
-                return
-        if self.page > 0 and _in_rect(*self._prev_rect()):
-            self.page = max(0, self.page - 3)
-            return
-        if self.page + 3 < len(self.options) and _in_rect(*self._next_rect()):
-            self.page += 3
-            return
+
+    def _handle_footer_click(self) -> bool:
         if self.request.min_count == 0 and _in_rect(*self._skip_rect()):
             self.selected.clear()
             self._submit()
-            return
+            return True
         if _in_rect(*self._confirm_rect()):
             self._submit()
+            return True
+        return False
+
+    def _update_browser(self) -> None:
+        if pyxel.btnp(pyxel.KEY_LEFT):
+            self.page = max(0, self.page - self.CARD_PAGE_SIZE)
+        if pyxel.btnp(pyxel.KEY_RIGHT):
+            self.page = min(
+                max(len(self.options) - self.CARD_PAGE_SIZE, 0),
+                self.page + self.CARD_PAGE_SIZE,
+            )
+        for key, index in HAND_SELECT_KEYS[: self.CARD_PAGE_SIZE]:
+            if pyxel.btnp(key):
+                cards = self._visible_cards()
+                if index < len(cards):
+                    self._toggle(cards[index])
+        for card, x, y, w, h in self._card_browser_rects():
+            if _in_rect(x, y, w, h):
+                self.scene.tooltip.pump_energy(card.name, card.description or "")
+                if pyxel.btnr(pyxel.MOUSE_BUTTON_LEFT):
+                    self._toggle(card)
+                return
+        if pyxel.btnr(pyxel.MOUSE_BUTTON_LEFT):
+            if self.page > 0 and _in_rect(*self._prev_rect()):
+                self.page = max(0, self.page - self.CARD_PAGE_SIZE)
+                return
+            if self.page + self.CARD_PAGE_SIZE < len(self.options) and _in_rect(
+                *self._next_rect()
+            ):
+                self.page += self.CARD_PAGE_SIZE
+
+    def _update_hand(self) -> None:
+        sprites = self._hand_option_sprites()
+        for key, index in HAND_SELECT_KEYS:
+            if pyxel.btnp(key) and index < len(self.scene.card_sprites):
+                sprite = self.scene.card_sprites[index]
+                if sprite in sprites:
+                    self._toggle(sprite.card)
+                    return
+        for sprite in sprites:
+            if sprite.is_mouse_over():
+                self.scene.tooltip.pump_energy(
+                    sprite.card.name, sprite.card.description or ""
+                )
+                if pyxel.btnr(pyxel.MOUSE_BUTTON_LEFT):
+                    self._toggle(sprite.card)
+                return
+
+    def _update_targets(self) -> None:
+        for key, index in HAND_SELECT_KEYS[: len(self.request.candidates)]:
+            if pyxel.btnp(key) and index < len(self.request.candidates):
+                self._toggle(self.request.candidates[index])
+                if self.request.min_count == self.request.max_count == 1:
+                    self._submit()
+                return
+        if not pyxel.btnr(pyxel.MOUSE_BUTTON_LEFT):
+            return
+        for target, x, y, w, h in self._target_sprite_rects():
+            if _in_rect(x, y, w, h):
+                self._toggle(target)
+                if self.request.min_count == self.request.max_count == 1:
+                    self._submit()
+                return
 
     def take_submission(self) -> dict | None:
         submission = self.submission
@@ -1176,67 +1283,137 @@ class PlayerChoiceOverlay:
         return submission
 
     def draw(self) -> None:
-        x, y, w, h = 48, 42, 331, 154
-        with dithering(0.35):
+        kind = self._choice_kind()
+        with dithering(0.45 if kind == "browser" else 0.25):
             pyxel.rect(0, 0, WINDOW_WIDTH, WINDOW_HEIGHT, 0)
-        draw_rounded_rectangle(x, y, w, h, 4, 1)
-        pyxel.rectb(x, y, w, h, 7)
+        self._draw_prompt_bands()
+        if kind == "browser":
+            self._draw_browser()
+        elif kind == "hand":
+            self._draw_hand()
+        else:
+            self._draw_targets()
+        self._draw_footer_actions()
+
+    def _draw_prompt_bands(self) -> None:
+        black_gradient_inverse(0, 0, WINDOW_WIDTH, 44)
+        black_gradient(0, WINDOW_HEIGHT - 40, WINDOW_WIDTH, 40)
         if self.request.reason:
-            visible_chars = min(len(self.request.reason), 24 + self.reason_timer // 2)
+            visible_chars = min(len(self.request.reason), 28 + self.reason_timer // 2)
             retro_text(
-                x + 12,
-                y + 10,
+                8,
+                7,
                 self.request.reason[:visible_chars],
                 13,
-                layout=layout(w=w - 24, h=20, ha="center"),
+                layout=layout(w=WINDOW_WIDTH - 16, h=11, ha="center", va="center"),
             )
         shadowed_text(
-            x + 12,
-            y + 34,
+            12,
+            21,
             self.request.prompt,
             7,
-            layout(w=w - 24, h=18, ha="center", va="center"),
+            layout(w=WINDOW_WIDTH - 24, h=14, ha="center", va="center"),
         )
-        counter = f"({len(self.selected)}/{self.request.max_count})"
-        retro_text(x + w - 54, y + 56, counter, 7, layout=layout(w=44, ha="right"))
+        count = f"{len(self.selected)}/{self.request.max_count}"
+        if self.request.min_count != self.request.max_count:
+            count = f"{len(self.selected)} ({self.request.min_count}-{self.request.max_count})"
+        retro_text(WINDOW_WIDTH - 54, 31, count, 10, layout=layout(w=44, ha="right"))
 
-        for index, option in enumerate(self._visible_options()):
-            sx, sy, sw, sh = self._slot_rect(index)
-            option_id = self._option_id(option)
-            selected = option_id in self.selected
-            draw_rounded_rectangle(sx, sy, sw, sh, 3, 5 if selected else 0)
-            pyxel.rectb(sx, sy, sw, sh, 10 if selected else 7)
-            retro_text(
-                sx + 5,
-                sy + 8,
-                option_id,
-                13,
-                layout=layout(w=sw - 10, ha="center"),
+    def _draw_browser(self) -> None:
+        for card, x, y, w, h in self._card_browser_rects():
+            selected = card.short_id() in self.selected
+            hovering = _in_rect(x, y, w, h)
+            if selected:
+                self._draw_selection_frame(x, y, w, h, 10)
+            elif hovering:
+                self._draw_selection_frame(x, y, w, h, 7)
+            pyxel.blt(
+                x,
+                y - (3 if hovering else 0),
+                self.scene.card_printer.print_card(card),
+                0,
+                0,
+                w,
+                h,
+                colkey=254,
             )
+            if selected:
+                pyxel.circ(x + w - 6, y + 6, 5, 10)
+                retro_text(x + w - 10, y + 3, "*", 0, layout=layout(w=8, ha="center"))
             retro_text(
-                sx + 5,
-                sy + 24,
-                self._option_title(option),
-                7,
-                layout=layout(w=sw - 10, h=24, ha="center", va="center"),
+                x, y + h + 4, card.short_id(), 13, layout=layout(w=w, ha="center")
             )
-
         if self.page > 0:
-            px, py, pw, ph = self._prev_rect()
-            draw_rounded_rectangle(px, py, pw, ph, 3, 0)
-            retro_text(px, py + 4, "<", 7, layout=layout(w=pw, ha="center"))
-        if self.page + 3 < len(self.options):
-            nx, ny, nw, nh = self._next_rect()
-            draw_rounded_rectangle(nx, ny, nw, nh, 3, 0)
-            retro_text(nx, ny + 4, ">", 7, layout=layout(w=nw, ha="center"))
+            self._draw_page_button(self._prev_rect(), "<")
+        if self.page + self.CARD_PAGE_SIZE < len(self.options):
+            self._draw_page_button(self._next_rect(), ">")
 
+    def _draw_hand(self) -> None:
+        for sprite in self._hand_option_sprites():
+            selected = sprite.card.short_id() in self.selected
+            hovering = sprite.is_mouse_over()
+            if selected:
+                self._draw_selection_frame(
+                    int(sprite.x), int(sprite.y), sprite.width, sprite.height, 10
+                )
+            elif hovering:
+                self._draw_selection_frame(
+                    int(sprite.x), int(sprite.y), sprite.width, sprite.height, 7
+                )
+            else:
+                self._draw_selection_frame(
+                    int(sprite.x), int(sprite.y), sprite.width, sprite.height, 5
+                )
+        retro_text(
+            0,
+            WINDOW_HEIGHT - 54,
+            "Choose directly from your hand",
+            13,
+            layout=layout(w=WINDOW_WIDTH, ha="center"),
+        )
+
+    def _draw_targets(self) -> None:
+        for target, x, y, w, h in self._target_sprite_rects():
+            selected = target.name in self.selected
+            hovering = _in_rect(x, y, w, h)
+            color = 10 if selected else 7 if hovering else 5
+            self._draw_selection_frame(x, y, w, h, color)
+            pyxel.line(x + w // 2 - 8, y + h // 2, x + w // 2 + 8, y + h // 2, color)
+            pyxel.line(x + w // 2, y + h // 2 - 8, x + w // 2, y + h // 2 + 8, color)
+            retro_text(
+                x - 18,
+                y + h + 2,
+                target.name,
+                color,
+                layout=layout(w=w + 36, ha="center"),
+            )
+
+    def _draw_footer_actions(self) -> None:
         if self.request.min_count == 0:
-            sx, sy, sw, sh = self._skip_rect()
-            draw_rounded_rectangle(sx, sy, sw, sh, 3, 0)
-            retro_text(sx, sy + 4, "Skip", 7, layout=layout(w=sw, ha="center"))
-        cx, cy, cw, ch = self._confirm_rect()
-        draw_rounded_rectangle(cx, cy, cw, ch, 3, 5 if self.selection_valid() else 13)
-        retro_text(cx, cy + 4, "Confirm", 7, layout=layout(w=cw, ha="center"))
+            self._draw_text_button(self._skip_rect(), "Skip", True)
+        self._draw_text_button(self._confirm_rect(), "Confirm", self.selection_valid())
+
+    def _draw_page_button(self, rect: tuple[int, int, int, int], label: str) -> None:
+        self._draw_text_button(rect, label, True)
+
+    def _draw_text_button(
+        self, rect: tuple[int, int, int, int], label: str, enabled: bool
+    ) -> None:
+        x, y, w, h = rect
+        hovering = enabled and _in_rect(x, y, w, h)
+        fill = 5 if enabled else 13
+        if hovering:
+            fill = 10
+        draw_rounded_rectangle(x, y, w, h, 3, fill)
+        pyxel.rectb(x, y, w, h, 7 if enabled else 5)
+        retro_text(
+            x, y + 5, label, 7 if enabled else 5, layout=layout(w=w, ha="center")
+        )
+
+    def _draw_selection_frame(self, x: int, y: int, w: int, h: int, color: int) -> None:
+        pulse = 1 + int(sin_01(self.reason_timer, 0.18) * 2)
+        pyxel.rectb(x - 3, y - 3, w + 6, h + 6, color)
+        pyxel.rectb(x - pulse, y - pulse, w + pulse * 2, h + pulse * 2, 7)
 
 
 class ResolvingSide(Enum):
