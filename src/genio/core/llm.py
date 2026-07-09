@@ -38,7 +38,14 @@ class GeminiLLM:
     def client(self) -> genai.Client:
         if self._client is None:
             load_dotenv()
-            self._client = genai.Client()
+            self._client = genai.Client(
+                http_options=types.HttpOptions(
+                    timeout=60_000,
+                    retry_options=types.HttpRetryOptions(
+                        attempts=5, initial_delay=1.0, max_delay=30.0
+                    ),
+                )
+            )
         return self._client
 
     def generate_content(
