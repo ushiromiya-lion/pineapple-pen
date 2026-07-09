@@ -1083,6 +1083,7 @@ class PlayerChoiceOverlay:
         self.page = 0
         self.submission: dict | None = None
         self.reason_timer = 0
+        self.last_update_timer = -1
 
     @property
     def options(self) -> list[Card] | list[Battler]:
@@ -1191,6 +1192,9 @@ class PlayerChoiceOverlay:
             self.submission = {"targets": list(self.selected)}
 
     def update(self) -> None:
+        if self.last_update_timer == self.scene.timer:
+            return
+        self.last_update_timer = self.scene.timer
         self.reason_timer += 1
         if pyxel.btnr(pyxel.MOUSE_BUTTON_LEFT) and self._handle_footer_click():
             return
@@ -1758,7 +1762,7 @@ class MainScene(Scene):
         self.check_mailbox()
         self.check_prefix_mailbox()
         self.check_letter_replacement_mailbox()
-        self.update_choice_overlay()
+        self.open_pending_choice_overlay()
         self.update_buttons_state()
         self.tweens_signpost.update()
         self.background_video.update()
@@ -1809,6 +1813,9 @@ class MainScene(Scene):
                 self.bundle.harness.submit_choice(submission)
                 self.choice_overlay = None
             return True
+        return self.open_pending_choice_overlay()
+
+    def open_pending_choice_overlay(self) -> bool:
         if self.futures and (choice := self.bundle.harness.pending_choice) is not None:
             self.choice_overlay = PlayerChoiceOverlay(self, choice)
             return True
