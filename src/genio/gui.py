@@ -1176,6 +1176,8 @@ class PlayerChoiceOverlay:
     def _toggle(self, option: Card | Battler) -> None:
         option_id = self._option_id(option)
         if option_id in self.selected:
+            if self.request.max_count == 1:
+                return
             self.selected.remove(option_id)
             return
         if self.request.max_count == 1:
@@ -1196,7 +1198,7 @@ class PlayerChoiceOverlay:
             return
         self.last_update_timer = self.scene.timer
         self.reason_timer += 1
-        if pyxel.btnr(pyxel.MOUSE_BUTTON_LEFT) and self._handle_footer_click():
+        if pyxel.btnp(pyxel.MOUSE_BUTTON_LEFT) and self._handle_footer_click():
             return
         kind = self._choice_kind()
         if kind == "browser":
@@ -1238,10 +1240,10 @@ class PlayerChoiceOverlay:
         for card, x, y, w, h in self._card_browser_rects():
             if _in_rect(x, y, w, h):
                 self.scene.tooltip.pump_energy(card.name, card.description or "")
-                if pyxel.btnr(pyxel.MOUSE_BUTTON_LEFT):
+                if pyxel.btnp(pyxel.MOUSE_BUTTON_LEFT):
                     self._toggle(card)
                 return
-        if pyxel.btnr(pyxel.MOUSE_BUTTON_LEFT):
+        if pyxel.btnp(pyxel.MOUSE_BUTTON_LEFT):
             if self.page > 0 and _in_rect(*self._prev_rect()):
                 self.page = max(0, self.page - self.CARD_PAGE_SIZE)
                 return
@@ -1263,7 +1265,7 @@ class PlayerChoiceOverlay:
                 self.scene.tooltip.pump_energy(
                     sprite.card.name, sprite.card.description or ""
                 )
-                if pyxel.btnr(pyxel.MOUSE_BUTTON_LEFT):
+                if pyxel.btnp(pyxel.MOUSE_BUTTON_LEFT):
                     self._toggle(sprite.card)
                 return
 
@@ -1274,7 +1276,7 @@ class PlayerChoiceOverlay:
                 if self.request.min_count == self.request.max_count == 1:
                     self._submit()
                 return
-        if not pyxel.btnr(pyxel.MOUSE_BUTTON_LEFT):
+        if not pyxel.btnp(pyxel.MOUSE_BUTTON_LEFT):
             return
         for target, x, y, w, h in self._target_sprite_rects():
             if _in_rect(x, y, w, h):
