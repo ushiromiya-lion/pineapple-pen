@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 import uuid
 from collections import Counter, deque
 from collections.abc import Iterator, Sequence
@@ -9,7 +10,7 @@ from functools import cache, cached_property
 from heapq import heappop, heappush
 from itertools import chain
 from random import randint
-from typing import Annotated, Generic, Literal
+from typing import TYPE_CHECKING, Annotated, Generic, Literal
 
 import numpy as np
 import tiktoken
@@ -67,6 +68,9 @@ from genio.gears.sentence_embed import Corpus
 from genio.predef import access_predef, predef
 
 logger = get_logger()
+
+if TYPE_CHECKING:
+    from genio.battle_harness import BattleToolHarness
 
 
 def parse_card_description(description: str) -> tuple[str, str, int]:
@@ -885,6 +889,7 @@ def calculate_total_cost(cards: list[Card]) -> int:
 
 class BattleBundle:
     effects: SortedList[tuple[Battler | None, SinglePointEffect | GlobalEffect]]
+    _harness: BattleToolHarness | None
     proposed_cards: list[Card]
     player_artifacts: list[Artifact]
     rules: list[str | None]
@@ -910,6 +915,17 @@ class BattleBundle:
         self.proposed_cards = []
         self.battle_logs = []
         self.rules = [None] + access_predef("rules.default")
+        self._harness = None
+        self._harness_lock = threading.Lock()
+
+    @property
+    def harness(self) -> BattleToolHarness:
+        with self._harness_lock:
+            if self._harness is None:
+                from genio.battle_harness import BattleToolHarness
+
+                self._harness = BattleToolHarness(self)
+            return self._harness
 
     def active_items_with_description(self) -> Iterator[HasDescription]:
         for card in self.card_bundle.hand:
@@ -1008,7 +1024,7 @@ class BattleBundle:
                     self.effects.append(
                         effect.delay + self.turn_counter, (battler, effect)
                     )
-                    return battler, effect
+                    return None
                 applied_effect = self.apply_effect(caster, battler, effect, rng)
                 if applied_effect is None:
                     return None
@@ -1018,7 +1034,7 @@ class BattleBundle:
                     self.effects.append(
                         effect.delay + self.turn_counter, (None, effect)
                     )
-                    return None, effect
+                    return None
                 applied_effect = self.apply_effect(caster, None, effect, rng)
                 if applied_effect is None:
                     return None
@@ -1091,20 +1107,15 @@ class BattleBundle:
         self.deduct_energy(calculate_total_cost(cards))
         if known_effects := self.resolve_known_player_cards(cards):
             return known_effects
-        resolved_results: ResolvedResults = _judge_results(
-            cards,
-            self.player,
-            self.enemies,
-            self.battle_prelude.description,
-            player_hand=self.card_bundle.hand,
-            resolve_player_actions=True,
-            additional_guidance=list(self.prompt_injections()),
-            rules=self.formatted_rules(),
+        request = (
+            "The player plays the following cards, in order:\n"
+            + "\n".join(
+                f"- {card.short_id()}: {card.name}: {card.description}" for card in cards
+            )
+            + "\nResolve their effects with tool calls, then call finish_resolution."
         )
-        self.process_effects(resolved_results.results)
-        expired_effects = self.flush_expired_effects(self.rng)
-        expired_effects.rarity = resolved_results.significance
-        return expired_effects
+        resolved, _reason = self.harness.resolve(request, enemy_mode=False)
+        return resolved
 
     def player_cards_need_inference(self, cards: list[Card]) -> bool:
         return len(cards) != 1 or not card_can_resolve_without_llm(cards[0])
@@ -1154,19 +1165,13 @@ class BattleBundle:
     def resolve_enemy_actions(self) -> ResolvedEffects:
         if simple_effects := self.resolve_simple_enemy_actions():
             return simple_effects
-        resolved_results: ResolvedResults = _judge_results(
-            [],
-            self.player,
-            self.enemies,
-            self.battle_prelude.description,
-            player_hand=self.card_bundle.hand,
-            resolve_player_actions=False,
-            additional_guidance=list(self.prompt_injections()),
-            rules=self.formatted_rules(),
+        request = (
+            "Resolve the enemies' declared intents, in order:\n"
+            + "\n".join(f"- {enemy.name}: {enemy.current_intent}" for enemy in self.enemies)
+            + "\nUse source=<enemy name> on each action. Then call finish_resolution."
         )
-        self.process_effects(resolved_results.results)
-        expired_effects = self.flush_expired_effects(self.rng)
-        return expired_effects
+        resolved, _reason = self.harness.resolve(request, enemy_mode=True)
+        return resolved
 
     def enemy_actions_need_inference(self) -> bool:
         return any(
@@ -1517,7 +1522,7 @@ class BattleBundle:
         damage = -delta_hp
         damage = self._modify_damage_dealt(caster, damage)
         damage = self._modify_damage_taken(target, damage)
-        damage = max(damage, 0)
+        damage = max(0, int(damage))
         damage_result = target.receive_damage(damage, effect.pierce)
         if effect.drain and caster:
             caster.receive_heal(damage_result.damage_dealt)

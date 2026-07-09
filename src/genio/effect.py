@@ -323,7 +323,7 @@ def _validate_legacy_amount_status(
     try:
         evaluate_status_expr(expr, amount=1, counter=2)
         evaluate_status_condition(condition, amount=1, counter=2)
-    except UnsafeStatusExpression:
+    except (UnsafeStatusExpression, SyntaxError, ValueError, TypeError):
         logger.warning("Unmapped unsafe legacy status", name=name, rule=rule)
         return _parse_legacy_flat_status(name, counter_type, rule)
     return None
