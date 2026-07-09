@@ -15,6 +15,7 @@ from pyxelxl import blt_rot, layout
 from typing_extensions import assert_never
 
 from genio.base import WINDOW_HEIGHT, WINDOW_WIDTH, load_image
+from genio.card_rewards import generate_typist_card_rewards
 from genio.card import Card
 from genio.components import (
     CanAddAnim,
@@ -56,8 +57,6 @@ from genio.scene_stages import draw_lush_background
 from genio.stagegen import (
     IndividualBonusItem,
     generate_bonus_items,
-    generate_sat_flashcards,
-    generate_spyware_cards,
 )
 from genio.tween import Instant, Mutator, Tweener
 
@@ -301,7 +300,7 @@ class BoosterPack:
         self.events = []
         self.timer = 0
         self.state_timers = defaultdict(int)
-        self.allowed_cards = 2
+        self.allowed_cards = 1
         self.dead = False
         self.price = 8 if pack_type == BoosterPackType.SPY_THEMED else 10
 
@@ -448,29 +447,9 @@ class BoosterPack:
         self.events.append("faded_out")
 
     def generate_cards(self) -> list[Card]:
-        gen_fn = (
-            generate_sat_flashcards
-            if self.pack_type == BoosterPackType.STANDARDIZED_TEST_THEMED
-            else generate_spyware_cards
-        )
-        generated = gen_fn()
-        predefined = [
-            Card(
-                "Letter Remover",
-                "Strip away one letter from each card in your hand, preferring to remove the initial letter.",
-                card_art_name="sun moon",
-            ),
-            Card(
-                "Pluralize",
-                "Transform each card's name in your hand into its plural form.",
-                card_art_name="web of intrigue",
-            ),
-        ]
-        results = generated.to_cards()
-        if self.pack_type == BoosterPackType.SPY_THEMED:
-            results = predefined + results
-        results = results[:5]
-        return results
+        result = generate_typist_card_rewards(game_state.card_reward_rare_offset)
+        game_state.card_reward_rare_offset = result.rare_offset
+        return result.cards
 
 
 @dataclass

@@ -48,15 +48,16 @@ def test_sts_turn_baseline(card_bundle):
 
 def test_discrete_card_energy_costs():
     assert calculate_energy_cost([Card("Strike")]) == 1
-    assert calculate_energy_cost([Card("Bash")]) == 2
+    assert calculate_energy_cost([Card("Bash")]) == 1
+    assert calculate_energy_cost([Card("Bind")]) == 1
     assert calculate_energy_cost([Card("Dash", energy_cost=1)]) == 1
     assert calculate_energy_cost([Card("Letter Replacer")]) == 0
-    assert calculate_energy_cost([Card("Strike"), Card("Bash")]) == 3
+    assert calculate_energy_cost([Card("Strike"), Card("Bash")]) == 2
 
 
 def test_initial_deck_contains_typist_special_cards(card_bundle):
-    assert [card.name for card in card_bundle.deck].count("Strike") == 4
-    assert [card.name for card in card_bundle.deck].count("Defend") == 4
+    assert [card.name for card in card_bundle.deck].count("Bash") == 4
+    assert [card.name for card in card_bundle.deck].count("Bind") == 4
 
     prefix_cards = [card for card in card_bundle.deck if card.is_prefix_card()]
     replacer_cards = [
@@ -65,9 +66,8 @@ def test_initial_deck_contains_typist_special_cards(card_bundle):
 
     assert len(prefix_cards) == 1
     prefix_card = prefix_cards[0]
-    assert prefix_card.prefix == "D"
-    assert prefix_card.prefix_min_length == 4
-    assert prefix_card.prefix_max_length == 8
+    assert prefix_card.prefix_template == "^____"
+    assert prefix_card.prefix_role is None
     assert prefix_card.energy_cost == 1
     assert len(replacer_cards) == 1
     assert replacer_cards[0].energy_cost == 0
@@ -133,6 +133,70 @@ def test_prefix_card_randomizes_on_each_draw():
     assert 4 <= len(drawn_again.name) <= 8
 
 
+def test_template_prefix_card_randomizes_draw_letters():
+    prefix_card = Card(
+        name="*___ Attack",
+        prefix_template="*___",
+        prefix_role="Attack",
+        energy_cost=1,
+    )
+    card_bundle = CardBundle([prefix_card])
+
+    drawn = next(card_bundle.draw(1))
+
+    assert drawn.name.endswith(" Attack")
+    word_template = drawn.name.split()[0]
+    assert 4 <= len(word_template) <= 8
+    assert word_template[0].isalpha()
+    assert set(word_template[1:]) == {"_"}
+    assert 3 <= drawn.prefix_suffix_length() <= 7
+
+    suffix = "a" * drawn.prefix_suffix_length()
+    drawn.set_prefix_suffix(suffix)
+    assert "_" not in drawn.name
+    drawn.confirm_prefix_entry()
+    assert drawn.name == word_template[0].upper() + suffix
+    assert drawn.prefix_role == "Attack"
+
+
+def test_template_prefix_randomizes_blank_runs():
+    prefix_card = Card(
+        name="Re____",
+        prefix_template="Re____",
+        energy_cost=1,
+    )
+    card_bundle = CardBundle([prefix_card])
+
+    drawn = next(card_bundle.draw(1))
+
+    assert drawn.name.startswith("Re")
+    assert set(drawn.name[2:]) == {"_"}
+    assert 3 <= drawn.prefix_suffix_length() <= 7
+
+
+def test_template_prefix_permanent_letter_sticks_between_draws():
+    prefix_card = Card(
+        name="^____",
+        prefix_template="^____",
+        energy_cost=1,
+    )
+    card_bundle = CardBundle([prefix_card])
+
+    drawn = next(card_bundle.draw(1))
+    first_letter = drawn.name[0]
+    drawn.set_prefix_suffix("a" * drawn.prefix_suffix_length())
+    drawn.confirm_prefix_entry()
+    drawn.finish_prefix_description("Do something.")
+    card_bundle.graveyard.append(drawn)
+
+    drawn_again = next(card_bundle.draw(1))
+
+    assert drawn_again is drawn
+    assert drawn_again.name[0] == first_letter
+    assert set(drawn_again.name[1:]) == {"_"}
+    assert 3 <= drawn_again.prefix_suffix_length() <= 7
+
+
 def test_known_sts_cards_resolve_without_llm(card_bundle):
     player = PlayerBattler.from_predef("players.starter")
     enemy = EnemyBattler.from_predef("enemies.sneaky_gremlin")
@@ -146,8 +210,10 @@ def test_known_sts_cards_resolve_without_llm(card_bundle):
 
     manager.replenish_energy()
     manager.resolve_player_cards([Card("Bash")])
-    assert enemy.hp == 16
-    assert enemy.status_effects[0].name == "vulnerable"
+    assert enemy.hp == 18
+
+    manager.resolve_player_cards([Card("Bind")])
+    assert player.shield_points == 10
 
 
 def test_simple_generated_fallback_card_resolves_without_llm(card_bundle):
@@ -166,6 +232,8 @@ def test_player_card_inference_gate(card_bundle):
     manager = BattleBundle(player, [enemy], BattlePrelude.default(), card_bundle)
 
     assert not manager.player_cards_need_inference([Card("Strike")])
+    assert not manager.player_cards_need_inference([Card("Bash")])
+    assert not manager.player_cards_need_inference([Card("Bind")])
     assert not manager.player_cards_need_inference([Card("Dash", "Deal 6 damage.")])
     assert manager.player_cards_need_inference([Card("Dash", "Gain 2 speed.")])
     assert manager.player_cards_need_inference([Card("Strike"), Card("Defend")])
@@ -233,10 +301,12 @@ def test_apply_damage_with_shield():
 
     damage_effect = SinglePointEffect.from_damage(9)
     rng = np.random.default_rng(42)
-    battle_bundle.apply_effect(None, player, damage_effect, rng)
+    applied_effect = battle_bundle.apply_effect(None, player, damage_effect, rng)
 
     assert player.hp == 24
     assert player.shield_points == 0
+    assert isinstance(applied_effect, SinglePointEffect)
+    assert applied_effect.damage == 6
 
 
 def test_apply_piercing_damage():
@@ -258,10 +328,12 @@ def test_apply_piercing_damage():
 
     damage_effect = SinglePointEffect.from_damage(9, pierce=True)
     rng = np.random.default_rng(42)
-    battle_bundle.apply_effect(None, player, damage_effect, rng)
+    applied_effect = battle_bundle.apply_effect(None, player, damage_effect, rng)
 
     assert player.hp == 21
     assert player.shield_points == 3
+    assert isinstance(applied_effect, SinglePointEffect)
+    assert applied_effect.damage == 9
 
 
 def test_apply_healing():

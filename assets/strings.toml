@@ -10,9 +10,9 @@ Typist fights by finishing half-seen words into sudden spells. Their deck turns 
 [initial_deck]
 
 cards = [
-    "Strike * 4 # Deal 6 damage.",
-    "Defend * 4 # Gain 5 Block.",
-    "D[Bash] * 1 # @prefix 4 8 cost 1",
+    "Bash * 4 # Deal 6 damage.",
+    "Bind * 4 # Gain 5 Block.",
+    "^____[Bash] * 1 # @template cost 1",
     "Letter Replacer * 1 # @cost 0",
 ]
 

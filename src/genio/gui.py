@@ -24,6 +24,7 @@ from genio.battle import (
     EnemyBattler,
     MainSceneLike,
     ResolvedEffects,
+    card_energy_cost,
 )
 from genio.card import Card
 from genio.components import (
@@ -162,6 +163,7 @@ class CardSprite:
         self.tweens = Tweener()
         self.xy_tweens = Tweener()
         self.rotation = 0
+        self.opacity = 1.0
         self.fade_timer = 0
         self.tweens.append(
             itertools.chain(
@@ -199,39 +201,24 @@ class CardSprite:
         else:
             raise ValueError("Cannot transition to resolving")
 
-        num_total_cards = len(self.app.bundle.card_bundle.resolving)
-        my_index = self.app.bundle.card_bundle.resolving.index(self.card)
-
-        self.update_delay += my_index * 6
-        self.index = 0
-
-        target_x = layout_center_for_n(num_total_cards, 400)[my_index] - self.width // 2
-        target_y = WINDOW_HEIGHT // 2 - self.height // 2
+        self.selected = False
+        self.dragging = False
+        self.hover_timer = -1
         self.tweens.flush()
+        self.xy_tweens.flush()
         self.tweens.append(
             itertools.chain(
-                range(10 + 4 * my_index),
                 EmitSound(SoundEv.CARD_MOVE),
-                MutableTweening(
-                    15, pytweening.easeInOutQuad, self, (target_x, target_y)
-                ),
-                range(4),
-                Instant(self.on_reach_hovering_location),
+                Mutator(8, pytweening.easeInQuad, self, "opacity", 0.0),
             )
         )
 
     def try_transitioning_to_resolved(self, i: int = 0, baseline: float = 1) -> None:
         self.state = CardState.RESOLVED
+        self.tweens.flush()
         self.tweens.append(
             itertools.chain(
-                range(int((10 + i * 5) * baseline)),
-                EmitSound(SoundEv.CARD_MOVE),
-                MutableTweening(
-                    15,
-                    pytweening.easeInOutQuad,
-                    self,
-                    (WINDOW_WIDTH + 10, WINDOW_HEIGHT - self.height - 2),
-                ),
+                Mutator(4, pytweening.easeInQuad, self, "opacity", 0.0),
             )
         )
 
@@ -250,13 +237,16 @@ class CardSprite:
         self.tweens.append(Shake(self, 20, 5))
 
     def draw(self):
+        if self.opacity <= 0:
+            return
         shift = 0
         if self.hover_timer > 0:
             shift = math.sin(self.hover_timer / 10) * 5
-        with camera_shift(0, shift):
-            if self.dragging or self.state == CardState.RESOLVING:
-                self.draw_shadow()
-            self._draw()
+        with dithering(self.opacity):
+            with camera_shift(0, shift):
+                if self.dragging or self.state == CardState.RESOLVING:
+                    self.draw_shadow()
+                self._draw()
 
     def draw_shadow(self):
         with dithering(0.5):
@@ -1151,6 +1141,7 @@ class MainScene(Scene):
         self.gold_renderer = GoldRenderer(game_state, self, 100, 0)
         self.updatables = []
         self.tweens_signpost = Tweener()
+        self.next_scene_requested = False
         self.player_sprite = WrappedImage(
             load_image("char", "char_celine.png"),
             0,
@@ -1299,6 +1290,9 @@ class MainScene(Scene):
             input_mode_active = self.update_prefix_card_input()
         if not input_mode_active:
             self.update_hand_selection_shortcuts()
+            if pyxel.btnp(pyxel.KEY_W):
+                self.debug_win_battle()
+
             if pyxel.btnp(pyxel.KEY_SPACE) and self.can_resolve_new_cards():
                 self.play_selected()
 
@@ -1384,6 +1378,12 @@ class MainScene(Scene):
         self.config_button.update()
         self.about_button.update()
         self.timer += 1
+
+    def debug_win_battle(self) -> None:
+        for enemy in self.bundle.enemies:
+            enemy.hp = 0
+        self.bundle.clear_dead()
+        self.add_popup("Victory", WINDOW_WIDTH // 2 - 20, 112, 10)
 
     def add_signpost(self, text: str) -> None:
         self.updatables.append(SignPost(WINDOW_WIDTH // 2, 50, text, self))
@@ -1576,6 +1576,8 @@ class MainScene(Scene):
                     original_description,
                     new_name,
                     self.bundle.player.name_stem,
+                    card_energy_cost(target),
+                    target.rarity,
                 ),
                 target.id,
             )
@@ -1747,6 +1749,9 @@ class MainScene(Scene):
                             generate_prefix_card_description,
                             card.name,
                             self.bundle.player.name_stem,
+                            card_energy_cost(card),
+                            card.rarity,
+                            card.prefix_role,
                         ),
                         card.id,
                     )
@@ -1760,10 +1765,6 @@ class MainScene(Scene):
         return True
 
     def on_receive_mail(self, effects: ResolvedEffects, used_framing: bool) -> None:
-        if self.resolving_side == ResolvingSide.PLAYER:
-            for in_progress_card in self.tmp_card_sprites:
-                in_progress_card.schedule_shake()
-
         if used_framing:
             self.framing.on_rarity_determined(effects.rarity)
         self.play_effects(effects)
@@ -1838,8 +1839,20 @@ class MainScene(Scene):
         self.popups.append(Popup(text, x, y, color))
 
     def request_next_scene(self) -> str | None:
+        if self.next_scene_requested:
+            return None
+        if self.bundle.is_player_victory() and not self.enemy_sprites:
+            self.next_scene_requested = True
+            return "genio.scene_card_reward"
         if pyxel.btnp(pyxel.KEY_Q):
-            return "genio.scene_booster"
+            self.next_scene_requested = True
+            return "genio.scene_card_reward"
+
+    def should_suppress_global_shortcuts(self) -> bool:
+        return (
+            self.selected_prefix_sprite() is not None
+            or self.letter_replacer_card is not None
+        )
 
     def should_all_cards_disabled(self) -> bool:
         if self.bundle.card_bundle.resolving:

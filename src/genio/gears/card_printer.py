@@ -129,12 +129,18 @@ class CardPrinter:
         single_word = card.name
         printables = printable_tokens(single_word)
         if printables:
+            readable_split_title = card.is_prefix_card() and len(printables) == 2
             for rot180_i, single_word in enumerate(printables):
+                if readable_split_title:
+                    self.print_text(image, single_word, False, bx=2 + rot180_i * 25)
+                    continue
                 rot180 = bool(rot180_i)
                 self.print_text(image, single_word, rot180)
         return image
 
-    def print_text(self, image: pyxel.Image, single_word: str, rot180: bool):
+    def print_text(
+        self, image: pyxel.Image, single_word: str, rot180: bool, bx: int = 2
+    ):
         skip = False
         if len(single_word) <= 5:
             compression = 0
@@ -152,10 +158,12 @@ class CardPrinter:
                 y_offset = y_mult * i + 4
                 if compression >= 1:
                     y_offset -= 1
-                bx = 2
+                letter_bx = bx
                 if compression >= 2:
-                    bx += 3 * (i % 2)
-                self.apply_serif_text(image, i, ch, y_offset, bx, compression, rot180)
+                    letter_bx += 3 * (i % 2)
+                self.apply_serif_text(
+                    image, i, ch, y_offset, letter_bx, compression, rot180
+                )
 
     def add_flashcard_text_to_card(self, text: str, image: pyxel.Image) -> None:
         rasterized = retro_font.rasterize(

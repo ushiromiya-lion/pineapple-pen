@@ -176,7 +176,7 @@ def test_process_effects_preserves_combined_targeted_effects():
     flushed = bundle.process_and_flush_effects(f"[{enemy.name}: damaged 5 | shield 3]")
 
     assert flushed.total_shield_gain() == 3
-    assert flushed.total_damage() == 5
+    assert flushed.total_damage() == 2
     assert enemy.hp == enemy.max_hp - 2
     assert enemy.shield_points == 0
 

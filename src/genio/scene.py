@@ -45,6 +45,9 @@ class Scene(ABC):
     def request_next_scene(self) -> Scene | None | str:
         return None
 
+    def should_suppress_global_shortcuts(self) -> bool:
+        return False
+
 
 class ReloadableScene(Scene):
     def __init__(self, scene_factory: Callable[[], Scene]) -> None:
@@ -76,6 +79,9 @@ class ReloadableScene(Scene):
 
     def request_next_scene(self) -> Scene | None | str:
         return self.current_version.request_next_scene()
+
+    def should_suppress_global_shortcuts(self) -> bool:
+        return self.current_version.should_suppress_global_shortcuts()
 
     def add_anim(self, *args, **kwargs) -> None:
         self.current_version.add_anim(*args, **kwargs)
@@ -169,6 +175,7 @@ class AppWithScenes:
             not self.futures
             and (next_scene := self.scenes[0].request_next_scene()) is not None
         ):
+            changed_scene_immediately = False
             match next_scene:
                 case (next_scene, fade_image) if isinstance(next_scene, str):
                     self.screenshot = fade_image
@@ -179,36 +186,48 @@ class AppWithScenes:
                     )
                     self.futures.append(fut)
                 case next_scene if isinstance(next_scene, str):
-                    fut = self.executor.submit(
-                        lambda: load_scene_from_module(
-                            importlib.import_module(next_scene)
-                        )
-                    )
                     self.screenshot = None
-                    self.futures.append(fut)
+                    scene = load_scene_from_module(importlib.import_module(next_scene))
+                    self.scenes.popleft()
+                    self.scenes.appendleft(scene)
+                    self.set_state(AppState.RUNNING)
+                    changed_scene_immediately = True
                 case _:
                     raise NotImplementedError
+            if self.state == AppState.RUNNING and not changed_scene_immediately:
+                self.set_state(AppState.TRANSITION_OUT)
         if self.futures and self.futures[0].done():
-            self.queue_scene(self.futures.popleft().result())
+            next_scene = self.futures.popleft().result()
+            if self.screenshot is None:
+                self.scenes.popleft()
+                self.scenes.appendleft(next_scene)
+                self.set_state(AppState.RUNNING)
+            else:
+                self.queue_scene(next_scene)
+        suppress_global_shortcuts = self.scenes[0].should_suppress_global_shortcuts()
         if self.state == AppState.RUNNING:
-            if pyxel.btnp(pyxel.KEY_R):
+            if pyxel.btnp(pyxel.KEY_R) and not suppress_global_shortcuts:
                 self.scenes[0].on_request_reload()
                 self.state = AppState.RUNNING
                 self.state_timers.clear()
-            if self.futures:
+            if self.futures or len(self.scenes) > 1:
                 self.set_state(AppState.TRANSITION_OUT)
         self.state_timers[self.state] += 1
 
         match self.state:
             case AppState.TRANSITION_OUT:
-                if self.state_timers[self.state] >= 90 and not self.futures:
+                if (
+                    self.state_timers[self.state] >= 30
+                    and not self.futures
+                    and len(self.scenes) > 1
+                ):
                     self.scenes.popleft()
                     self.set_state(AppState.TRANSITION_IN)
             case AppState.TRANSITION_IN:
-                if self.state_timers[self.state] >= 90:
+                if self.state_timers[self.state] >= 30:
                     self.set_state(AppState.RUNNING)
                     self.screenshot = None
-        if pyxel.btnp(pyxel.KEY_S):
+        if pyxel.btnp(pyxel.KEY_S) and not suppress_global_shortcuts:
             self.recorder.toggle_recording()
         self.play_all_audios()
         self.events.clear()

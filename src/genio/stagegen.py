@@ -115,14 +115,22 @@ class GeneratePrefixCardResult:
 
 @promptly()
 def generate_prefix_card_description(
-    card_name: str, player_name: str
+    card_name: str,
+    player_name: str,
+    card_cost: int,
+    card_rarity: str,
+    card_role: str | None = None,
 ) -> GeneratePrefixCardResult:
     """\
     Act as an excellent game designer.
 
     {{ player_name }} completed a prefix card into "{{ card_name }}".
-    Write only the effect text for that card. If the word is strange or nonsense,
-    interpret it playfully but keep it usable in combat.
+    This is a Slay-the-Spire-like card game. Write only the effect text for a
+    card that feels roughly like a {{ card_cost }}-cost {{ card_rarity }} card.
+    {% if card_role %}
+    It came from a visible "{{ card_role }}" template.
+    {% endif %}
+    If the word is strange or nonsense, interpret it playfully but keep it usable.
 
     {{ formatting_instructions }}
     """
@@ -147,14 +155,18 @@ def generate_letter_replacement_description(
     original_description: str | None,
     new_name: str,
     player_name: str,
+    card_cost: int,
+    card_rarity: str,
 ) -> GenerateLetterReplacementResult:
     """\
     Act as an excellent game designer.
 
     {{ player_name }} used Letter Replacer to change "{{ original_name }}" into
     "{{ new_name }}". Rewrite only the effect text for the new card. Preserve the
-    original card's rough power level and cost. If the new title is strange or
-    nonsense, interpret it playfully but keep it usable in combat.
+    original card's rough power level. This is a Slay-the-Spire-like card game,
+    and the card should feel roughly like a {{ card_cost }}-cost {{ card_rarity }}
+    card. If the new title is strange or nonsense, interpret it playfully but
+    keep it usable.
 
     Original effect:
     {{ original_description }}

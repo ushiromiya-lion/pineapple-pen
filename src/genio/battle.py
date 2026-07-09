@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 import uuid
+import re
 from collections import Counter, deque
 from collections.abc import Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -25,7 +26,6 @@ from typing_extensions import (
 
 from genio.artifacts import parse_stylize
 from genio.battle_commands import (
-    ApplyStatus,
     BattleCommand,
     DealDamage,
     GainBlock,
@@ -72,16 +72,17 @@ logger = get_logger()
 if TYPE_CHECKING:
     from genio.battle_harness import BattleToolHarness
 
+CARD_COPY_PATTERN = re.compile(r"^(?P<name>.*?)\s+\*\s+(?P<copies>\d+)$")
+
 
 def parse_card_description(description: str) -> tuple[str, str, int]:
     parts = description.split("#")
     main_part = parts[0].strip()
     desc = parts[1].strip() if len(parts) > 1 else None
 
-    if "*" in main_part:
-        name, copies_str = main_part.split("*")
-        name = name.strip()
-        copies = int(copies_str.strip())
+    if match := CARD_COPY_PATTERN.match(main_part):
+        name = match.group("name").strip()
+        copies = int(match.group("copies"))
     else:
         name = main_part
         copies = 1
@@ -114,6 +115,27 @@ def parse_cost_marker(description: str | None) -> int | None:
     return None
 
 
+def parse_template_marker(description: str | None) -> int | None:
+    if not description:
+        return None
+    parts = description.split()
+    if not parts or parts[0] not in {"@template", "@prefix_template"}:
+        return None
+    cost = 1
+    if len(parts) == 3 and parts[1] == "cost":
+        cost = int(parts[2])
+    return cost
+
+
+def parse_template_title(name: str) -> tuple[str, str | None] | None:
+    title_parts = name.split(maxsplit=1)
+    template = title_parts[0]
+    if "_" not in template:
+        return None
+    role = title_parts[1] if len(title_parts) > 1 else None
+    return template, role
+
+
 def create_deck(cards: list[str]) -> list[Card]:
     deck = []
     for card_description in cards:
@@ -136,6 +158,21 @@ def create_deck(cards: list[str]) -> list[Card]:
                         prefix_min_length=min_length,
                         prefix_max_length=max_length,
                         energy_cost=cost,
+                    )
+                )
+            elif (template_cost := parse_template_marker(desc)) is not None:
+                template_title = parse_template_title(name)
+                if template_title is None:
+                    raise ValueError(f"Template card title has no blanks: {name}")
+                template, role = template_title
+                deck.append(
+                    Card(
+                        name=name,
+                        description=None,
+                        card_art_name=effective_name,
+                        prefix_template=template,
+                        prefix_role=role,
+                        energy_cost=template_cost,
                     )
                 )
             elif (cost_marker := parse_cost_marker(desc)) is not None:
@@ -346,7 +383,9 @@ class Battler:
             raise ValueError("Damage must be a positive integer")
         if pierce:
             self.hp -= damage
-            return DamageResult.default()
+            if self.hp < 0:
+                self.hp = 0
+            return DamageResult(damage)
         shield_damage = min(self.shield_points, damage)
         rest_damage = max(damage - shield_damage, 0)
         self.shield_points -= shield_damage
@@ -524,7 +563,8 @@ class CardBundle:
                             card.prefix_min_length,
                             card.prefix_max_length + 1,
                         )
-                    )
+                    ),
+                    self.rng,
                 )
             yield card
             count -= 1
@@ -1133,25 +1173,12 @@ class BattleBundle:
         commands: list[BattleCommand] = []
 
         match card_name:
-            case "strike" if target:
+            case "strike" | "bash" if target:
                 commands.append(DealDamage(target=target.name, amount=6))
                 rarity = 1
-            case "defend":
+            case "defend" | "bind":
                 commands.append(GainBlock(target=self.player.name, amount=5))
                 rarity = 1
-            case "bash" if target:
-                commands.append(DealDamage(target=target.name, amount=8))
-                vulnerable = StatusDefinition(
-                    name="vulnerable",
-                    trigger=OnDamageTaken(),
-                    reaction=ModifyAmount(expr="amount * 1.5"),
-                    counter_type="turns",
-                    description="Takes 50% more attack damage.",
-                )
-                commands.append(
-                    ApplyStatus(target=target.name, status=vulnerable, duration=2)
-                )
-                rarity = 2
             case _ if target and card_description == "deal 6 damage.":
                 commands.append(DealDamage(target=target.name, amount=6))
                 rarity = 1
@@ -1526,7 +1553,7 @@ class BattleBundle:
         damage_result = target.receive_damage(damage, effect.pierce)
         if effect.drain and caster:
             caster.receive_heal(damage_result.damage_dealt)
-        return replace(effect, delta_hp=-damage)
+        return replace(effect, delta_hp=-damage_result.damage_dealt)
 
     def _apply_healing(self, target: Battler, delta_hp: float) -> None:
         target.receive_heal(delta_hp)
@@ -1629,7 +1656,7 @@ def normalized_card_description(card: Card) -> str:
 def card_can_resolve_without_llm(card: Card) -> bool:
     if normalized_card_description(card) == "deal 6 damage.":
         return True
-    return card.name.lower().rstrip("+") in {"strike", "defend", "bash"}
+    return card.name.lower().rstrip("+") in {"strike", "defend", "bash", "bind"}
 
 
 def card_energy_cost(card: Card) -> int:
@@ -1637,8 +1664,4 @@ def card_energy_cost(card: Card) -> int:
         return card.energy_cost
     if card.name.lower().rstrip("+") == "letter replacer":
         return 0
-    match card.name.lower().rstrip("+"):
-        case "bash":
-            return 2
-        case _:
-            return 1
+    return 1

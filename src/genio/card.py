@@ -5,12 +5,17 @@ import uuid
 from base64 import b32encode
 from dataclasses import dataclass, field
 from functools import lru_cache
+from string import ascii_lowercase
+from typing import Any
 
 from parse import parse
 
 keywords = re.compile(
     r"\b(?:noun|verb|adjective|adverb|pronoun|preposition|conjunction|interjection|article|determiner|auxiliary verb|modal verb|particle|gerund|infinitive|participle)\b"
 )
+
+DEFAULT_TEMPLATE_MIN_BLANKS = 3
+DEFAULT_TEMPLATE_MAX_BLANKS = 7
 
 
 @lru_cache(16)
@@ -28,12 +33,16 @@ class Card:
 
     card_art_name: str | None = None
     prefix: str | None = None
-    prefix_min_length: int = 0
-    prefix_max_length: int = 0
+    prefix_template: str | None = None
+    prefix_draw_template: str | None = None
+    prefix_role: str | None = None
+    prefix_min_length: int = DEFAULT_TEMPLATE_MIN_BLANKS
+    prefix_max_length: int = DEFAULT_TEMPLATE_MAX_BLANKS
     prefix_length: int | None = None
     prefix_typed: str = ""
     prefix_pending: bool = False
     energy_cost: int | None = None
+    rarity: str = "common"
     temporary_original_name: str | None = None
     temporary_original_description: str | None = None
     temporary_original_card_art_name: str | None = None
@@ -69,12 +78,16 @@ class Card:
             description=self.description,
             card_art_name=self.card_art_name,
             prefix=self.prefix,
+            prefix_template=self.prefix_template,
+            prefix_draw_template=self.prefix_draw_template,
+            prefix_role=self.prefix_role,
             prefix_min_length=self.prefix_min_length,
             prefix_max_length=self.prefix_max_length,
             prefix_length=self.prefix_length,
             prefix_typed=self.prefix_typed,
             prefix_pending=self.prefix_pending,
             energy_cost=self.energy_cost,
+            rarity=self.rarity,
         )
 
     def begin_temporary_transform(
@@ -105,11 +118,16 @@ class Card:
         return self.temporary_original_name is not None
 
     def is_prefix_card(self) -> bool:
-        return self.prefix is not None
+        return self.prefix is not None or self.prefix_template is not None
 
     def prefix_suffix_length(self) -> int:
         if not self.is_prefix_card() or self.prefix_length is None:
-            return 0
+            if self.prefix_template is None:
+                return 0
+            return self.prefix_template.count("_")
+        if self.prefix_template is not None:
+            template = self.prefix_draw_template or self.prefix_template
+            return template.count("_")
         return max(self.prefix_length - len(self.prefix or ""), 0)
 
     def is_prefix_filled(self) -> bool:
@@ -126,8 +144,65 @@ class Card:
             and "_" not in self.name
         )
 
-    def prepare_prefix_draw(self, length: int) -> None:
+    def _random_template_letter(self, rng: Any | None = None) -> str:
+        if rng is None:
+            import random
+
+            return random.choice(ascii_lowercase)
+        return ascii_lowercase[int(rng.integers(0, len(ascii_lowercase)))]
+
+    def _with_permanent_template_letters(self, rng: Any | None = None) -> str:
+        template = self.prefix_template or ""
+        if "^" not in template:
+            return template
+        template = "".join(
+            self._random_template_letter(rng) if ch == "^" else ch
+            for ch in template
+        )
+        self.prefix_template = template
+        return template
+
+    def _format_template_name(self, word_template: str) -> str:
+        if self.prefix_role and "_" in word_template:
+            return f"{word_template} {self.prefix_role}"
+        return word_template
+
+    def _with_randomized_blanks(self, template: str, blank_count: int) -> str:
+        blank_count = max(0, blank_count)
+        return re.sub(r"_+", "_" * blank_count, template)
+
+    def _render_template_word(self) -> str:
+        template = self.prefix_draw_template or self.prefix_template or ""
+        typed = iter(self.prefix_typed)
+        rendered = []
+        for ch in template:
+            if ch == "_":
+                rendered.append(next(typed, "_"))
+            else:
+                rendered.append(ch)
+        return "".join(rendered)
+
+    def prepare_prefix_reward(self, rng: Any | None = None) -> None:
+        if self.prefix_template is None:
+            return
+        self._with_permanent_template_letters(rng)
+        self.name = self._format_template_name(self.prefix_template)
+
+    def prepare_prefix_draw(self, length: int, rng: Any | None = None) -> None:
         if not self.is_prefix_card():
+            return
+        if self.prefix_template is not None:
+            template = self._with_permanent_template_letters(rng)
+            template = self._with_randomized_blanks(template, length)
+            self.prefix_draw_template = "".join(
+                self._random_template_letter(rng) if ch == "*" else ch
+                for ch in template
+            )
+            self.prefix_length = len(self.prefix_draw_template)
+            self.prefix_typed = ""
+            self.prefix_pending = False
+            self.description = None
+            self.name = self._format_template_name(self.prefix_draw_template)
             return
         prefix = self.prefix or ""
         self.prefix_length = max(length, len(prefix))
@@ -141,6 +216,11 @@ class Card:
             return
         suffix = "".join(ch for ch in suffix if ch.isalpha()).lower()
         self.prefix_typed = suffix[: self.prefix_suffix_length()]
+        if self.prefix_template is not None:
+            self.name = self._format_template_name(self._render_template_word())
+            self.description = None
+            self.prefix_pending = False
+            return
         remaining = self.prefix_suffix_length() - len(self.prefix_typed)
         self.name = f"{self.prefix}{self.prefix_typed}{'_' * remaining}"
         self.description = None
@@ -160,7 +240,10 @@ class Card:
     def confirm_prefix_entry(self) -> None:
         if not self.is_prefix_filled():
             return
-        word = f"{self.prefix}{self.prefix_typed}"
+        if self.prefix_template is not None:
+            word = self._render_template_word()
+        else:
+            word = f"{self.prefix}{self.prefix_typed}"
         self.name = word[:1].upper() + word[1:].lower()
         self.description = None
         self.prefix_pending = True
