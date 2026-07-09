@@ -36,7 +36,7 @@ def finish_declaration() -> types.FunctionDeclaration:
     )
 
 
-def make_session(generate_fn, ping_handler=None) -> ToolLoopSession:
+def make_session(generate_fn, ping_handler=None, finish_handler=None) -> ToolLoopSession:
     def handle_ping(args: dict) -> dict:
         x = int(args["x"])
         if x < 0:
@@ -50,7 +50,7 @@ def make_session(generate_fn, ping_handler=None) -> ToolLoopSession:
         model="fake",
         tools=[
             ToolSpec(ping_declaration(), ping_handler or handle_ping),
-            ToolSpec(finish_declaration(), handle_finish, terminal=True),
+            ToolSpec(finish_declaration(), finish_handler or handle_finish, terminal=True),
         ],
         system_instruction="system",
         generate_fn=generate_fn,
@@ -159,6 +159,69 @@ def test_calls_after_terminal_in_same_batch_get_error():
     ) == [
         {"output": {"ok": True}},
         {"error": "resolution already committed; this call was ignored"},
+    ]
+
+
+def test_failed_terminal_does_not_ignore_later_batch_calls():
+    def handle_finish(args: dict) -> dict:
+        if args["note"] == "bad":
+            raise ToolError("bad finish")
+        return {"ok": True}
+
+    session = make_session(
+        scripted(
+            [
+                model_turn(fc_part("finish", {"note": "bad"}), fc_part("ping", {"x": 1})),
+                model_turn(fc_part("finish", {"note": "ok"})),
+            ]
+        ),
+        finish_handler=handle_finish,
+    )
+
+    result = session.run_turn("go")
+
+    assert result.completed is True
+    assert function_responses(session.history[2]) == [
+        {"error": "bad finish"},
+        {"output": {"pong": 1}},
+    ]
+
+
+def test_forced_finish_error_is_answered_in_history():
+    def handle_finish(args: dict) -> dict:
+        raise ToolError("bad finish")
+
+    session = make_session(
+        scripted([model_turn(fc_part("finish", {"note": "bad"}))]),
+        finish_handler=handle_finish,
+    )
+
+    result = session.run_turn("go", max_model_turns=0)
+
+    assert result.completed is False
+    assert session.history[-1].role == "user"
+    assert function_responses(session.history[-1]) == [{"error": "bad finish"}]
+
+
+def test_unexpected_handler_exception_is_repairable_error():
+    def handle_ping(args: dict) -> dict:
+        raise RuntimeError("boom")
+
+    session = make_session(
+        scripted(
+            [
+                model_turn(fc_part("ping", {"x": 1})),
+                model_turn(fc_part("finish", {"note": "ok"})),
+            ]
+        ),
+        ping_handler=handle_ping,
+    )
+
+    result = session.run_turn("go")
+
+    assert result.completed is True
+    assert function_responses(session.history[2]) == [
+        {"error": "internal tool error: boom"}
     ]
 
 

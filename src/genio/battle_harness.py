@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -265,10 +266,13 @@ class BattleToolHarness:
         )
         self._staged: list[tuple[Battler | None, BattleCommand]] = []
         self._consumed_card_ids: set[str] = set()
+        self._consumed_card_names: dict[str, str] = {}
         self._default_caster: Battler | None = None
         self._enemy_mode = False
         self._last_resolved: ResolvedEffects | None = None
         self._last_reason = ""
+        self._queued_effects: list[str] = []
+        self._resolve_lock = threading.RLock()
 
     def _build_tools(self) -> list[ToolSpec]:
         handlers = {
@@ -327,14 +331,31 @@ class BattleToolHarness:
         return ", ".join(card.short_id() for card in self.bundle.card_bundle.hand)
 
     def _card(self, card_id: str) -> Card:
-        if card_id in self._consumed_card_ids:
-            raise ToolError(f'card "{card_id}" was already consumed earlier in this resolution')
+        raw = str(card_id).lower()
+        if raw in self._consumed_card_ids:
+            raise ToolError(
+                f'card "{raw}" was already consumed earlier in this resolution'
+            )
+        if consumed_id := self._consumed_card_names.get(raw):
+            raise ToolError(
+                f'card "{consumed_id}" was already consumed earlier in this resolution'
+            )
         try:
-            return self.bundle.card_bundle.seek_card(card_id)
+            card = self.bundle.card_bundle.seek_card(card_id)
         except ValueError as exc:
             raise ToolError(
                 f'card "{card_id}" does not exist. Valid hand ids: {self._hand_ids()}'
             ) from exc
+        normalized_id = card.short_id()
+        if normalized_id in self._consumed_card_ids:
+            raise ToolError(
+                f'card "{normalized_id}" was already consumed earlier in this resolution'
+            )
+        if consumed_id := self._consumed_card_names.get(card.name.lower()):
+            raise ToolError(
+                f'card "{consumed_id}" was already consumed earlier in this resolution'
+            )
+        return card
 
     def _req(self, args: dict, key: str) -> Any:
         if key not in args:
@@ -446,14 +467,24 @@ class BattleToolHarness:
         raise ToolError(f'invalid reaction kind "{kind}"')
 
     def _stage(self, command: BattleCommand, caster: Battler | None) -> None:
+        def remember(card_id: str) -> None:
+            self._consumed_card_ids.add(card_id)
+            try:
+                name = self.bundle.card_bundle.seek_card(card_id).name.lower()
+                self._consumed_card_names[name] = card_id
+            except ValueError:
+                pass
+
         self._staged.append((caster, command))
         match command:
             case DiscardCards(card_ids=card_ids):
-                self._consumed_card_ids.update(card_ids)
+                for card_id in card_ids:
+                    remember(card_id)
             case DestroyCard(card_ids=card_ids):
-                self._consumed_card_ids.update(card_ids)
+                for card_id in card_ids:
+                    remember(card_id)
             case TransformCard(card_id=card_id):
-                self._consumed_card_ids.add(card_id)
+                remember(card_id)
 
     def _projection_note(self, command: BattleCommand, target: Battler | None) -> str:
         if not isinstance(command, DealDamage) or target is None:
@@ -633,7 +664,11 @@ class BattleToolHarness:
 
     def _commit(self, reason: str, significance: int):
         applied = []
-        for caster, command in self._staged:
+        staged_count = len(self._staged)
+        while self._staged:
+            caster, command = self._staged.pop(0)
+            if command.delay > 0:
+                self._queued_effects.append(type(command).__name__)
             if result := self.bundle.apply_command(command, caster=caster):
                 applied.append(result)
         self.bundle.clear_dead()
@@ -642,11 +677,16 @@ class BattleToolHarness:
         from genio.battle import ResolvedEffects
 
         resolved = ResolvedEffects(applied)
-        resolved.rarity = significance
+        resolved.rarity = -1 if self._enemy_mode else significance
         self._last_resolved = resolved
         self._last_reason = reason
         logs = self.bundle._transform_to_battle_logs(resolved)
-        return resolved, {"committed": len(self._staged), "engine_log": logs}
+        return resolved, {
+            "committed": staged_count,
+            "applied": len(applied),
+            "queued": list(self._queued_effects),
+            "engine_log": logs,
+        }
 
     def _h_finish(self, args: dict) -> dict:
         reason = str(self._req(args, "reason"))
@@ -675,6 +715,12 @@ class BattleToolHarness:
         lines.append("Hand:")
         for card in self.bundle.card_bundle.hand:
             lines.append(f"- {card.short_id()}: {card.name} - {card.description or ''}")
+        if self.bundle.card_bundle.resolving:
+            lines.append("Resolving:")
+            for card in self.bundle.card_bundle.resolving:
+                lines.append(
+                    f"- {card.short_id()}: {card.name} - {card.description or ''}"
+                )
         rules = self.bundle.formatted_rules()
         if rules:
             lines.append("Rules:")
@@ -686,19 +732,23 @@ class BattleToolHarness:
         return "\n".join(lines)
 
     def resolve(self, request: str, *, enemy_mode: bool) -> tuple[ResolvedEffects, str]:
-        self._staged.clear()
-        self._consumed_card_ids.clear()
-        self._enemy_mode = enemy_mode
-        self._default_caster = None if enemy_mode else self.bundle.player
-        self._last_resolved = None
-        self._last_reason = ""
-        message = self._snapshot() + "\n\n" + request
-        self.session.run_turn(message)
-        if self._last_resolved is None:
-            resolved, _ = self._commit(
-                "(resolution aborted; applying staged commands)",
-                1,
-            )
-            logger.warning("harness fallback commit", staged=len(self._staged))
-            return resolved, self._last_reason
-        return self._last_resolved, self._last_reason
+        with self._resolve_lock:
+            self.session.history = []
+            self._staged.clear()
+            self._consumed_card_ids.clear()
+            self._consumed_card_names.clear()
+            self._queued_effects.clear()
+            self._enemy_mode = enemy_mode
+            self._default_caster = None if enemy_mode else self.bundle.player
+            self._last_resolved = None
+            self._last_reason = ""
+            message = self._snapshot() + "\n\n" + request
+            self.session.run_turn(message)
+            if self._last_resolved is None:
+                resolved, _ = self._commit(
+                    "(resolution aborted; applying staged commands)",
+                    1,
+                )
+                logger.warning("harness fallback commit", staged=len(self._staged))
+                return resolved, self._last_reason
+            return self._last_resolved, self._last_reason

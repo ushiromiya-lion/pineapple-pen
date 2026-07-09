@@ -113,6 +113,29 @@ def test_staged_conflict_destroy_then_duplicate():
     assert all(card.short_id() != card_id for card in bundle.card_bundle.graveyard)
 
 
+def test_staged_conflict_normalizes_card_name_before_consumed_check():
+    bundle = make_bundle()
+    card = bundle.card_bundle.hand[0]
+    card_id = card.short_id()
+    harness = BattleToolHarness(
+        bundle,
+        generate_fn=scripted(
+            [
+                model_turn(
+                    fc_part("destroy_card", {"card_ids": [card_id.upper()]}),
+                    fc_part("duplicate_card", {"card_id": card.name}),
+                    fc_part("finish_resolution", {"reason": "burned", "significance": 1}),
+                )
+            ]
+        ),
+    )
+
+    harness.resolve("resolve", enemy_mode=False)
+
+    responses = [part.function_response.response for part in harness.session._pending_responses]
+    assert responses[1]["error"] == f'card "{card_id}" was already consumed earlier in this resolution'
+
+
 def test_apply_status_typed_reaction():
     bundle = make_bundle()
     enemy = bundle.enemies[0]
@@ -282,6 +305,7 @@ def test_engine_log_reaches_next_turn():
     assert opening.parts[0].function_response.name == "deal_damage"
     assert opening.parts[1].function_response.name == "finish_resolution"
     assert "engine_log" in opening.parts[1].function_response.response["output"]
+    assert len(captured_contents[1]) == 1
 
 
 def test_fallback_commit_when_model_never_finishes():
@@ -329,6 +353,60 @@ def test_resolve_player_cards_uses_harness():
     assert resolved.rarity == 2
 
 
+def test_resolve_player_cards_request_includes_played_card_short_ids():
+    bundle = make_bundle()
+    captured_messages = []
+
+    def generate_fn(*, contents, config):
+        captured_messages.append(contents[-1].parts[-1].text)
+        return model_turn(
+            fc_part("finish_resolution", {"reason": "nothing", "significance": 1})
+        )
+
+    harness = BattleToolHarness(bundle, generate_fn=generate_fn)
+    bundle._harness = harness
+    card = Card("Cinder Loop", "Destroy this card after use.", energy_cost=0)
+    bundle.card_bundle.hand.append(card)
+    bundle.card_bundle.hand_to_resolving([card])
+
+    bundle.resolve_player_cards([card])
+
+    assert f"- {card.short_id()}:" in captured_messages[0]
+    assert "Resolving:" in captured_messages[0]
+
+
+def test_delayed_commands_are_queued_not_reported_as_applied():
+    bundle = make_bundle()
+    enemy = bundle.enemies[0]
+    harness = BattleToolHarness(
+        bundle,
+        generate_fn=scripted(
+            [
+                model_turn(
+                    fc_part(
+                        "deal_damage",
+                        {"target": enemy.name, "amount": 4, "delay": 1},
+                    ),
+                    fc_part("finish_resolution", {"reason": "later", "significance": 1}),
+                )
+            ]
+        ),
+    )
+
+    resolved, _ = harness.resolve("resolve", enemy_mode=False)
+
+    assert len(resolved) == 0
+    assert enemy.hp == enemy.max_hp
+    output = harness.session._pending_responses[-1].function_response.response["output"]
+    assert output["applied"] == 0
+    assert output["queued"] == ["DealDamage"]
+
+    bundle.turn_counter = 1
+    flushed = bundle.flush_expired_effects(bundle.rng)
+    assert flushed.total_damage() == 4
+    assert enemy.hp == enemy.max_hp - 4
+
+
 def test_resolve_enemy_actions_uses_harness():
     bundle = make_bundle()
     enemy = bundle.enemies[0]
@@ -358,5 +436,5 @@ def test_resolve_enemy_actions_uses_harness():
 
     resolved = bundle.resolve_enemy_actions()
 
-    assert resolved.rarity == 1
+    assert resolved.rarity == -1
     assert [status.name for status in bundle.player.status_effects] == ["hexed"]

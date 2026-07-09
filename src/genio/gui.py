@@ -1268,6 +1268,9 @@ class MainScene(Scene):
             and not self.futures
         )
 
+    def can_end_player_turn(self) -> bool:
+        return not self.futures
+
     def on_new_event(self, ev: str, *others: Any) -> None:
         self.sync_sprites(ev, *others)
 
@@ -1299,7 +1302,7 @@ class MainScene(Scene):
             if pyxel.btnp(pyxel.KEY_SPACE) and self.can_resolve_new_cards():
                 self.play_selected()
 
-            if pyxel.btnp(pyxel.KEY_E):
+            if pyxel.btnp(pyxel.KEY_E) and self.can_end_player_turn():
                 self.end_player_turn()
 
         for card in self.card_sprites:
@@ -1317,7 +1320,11 @@ class MainScene(Scene):
         if not input_mode_active and self.image_buttons[0].update():
             self.play_selected()
 
-        if not input_mode_active and self.image_buttons[1].update():
+        if (
+            not input_mode_active
+            and self.image_buttons[1].update()
+            and self.can_end_player_turn()
+        ):
             self.end_player_turn()
 
         self.energy_renderer.update()
@@ -2088,6 +2095,8 @@ class MainScene(Scene):
         pyxel.blt(x, y, cursor, 0, 0, 16, 16, colkey=254)
 
     def end_player_turn(self):
+        if not self.can_end_player_turn():
+            return
         self.tweens_signpost.append(
             range(6), Instant(lambda: self.add_signpost("Enemy Turn"))
         )

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 import uuid
 from collections import Counter, deque
 from collections.abc import Iterator, Sequence
@@ -915,14 +916,16 @@ class BattleBundle:
         self.battle_logs = []
         self.rules = [None] + access_predef("rules.default")
         self._harness = None
+        self._harness_lock = threading.Lock()
 
     @property
     def harness(self) -> BattleToolHarness:
-        if self._harness is None:
-            from genio.battle_harness import BattleToolHarness
+        with self._harness_lock:
+            if self._harness is None:
+                from genio.battle_harness import BattleToolHarness
 
-            self._harness = BattleToolHarness(self)
-        return self._harness
+                self._harness = BattleToolHarness(self)
+            return self._harness
 
     def active_items_with_description(self) -> Iterator[HasDescription]:
         for card in self.card_bundle.hand:
@@ -1021,7 +1024,7 @@ class BattleBundle:
                     self.effects.append(
                         effect.delay + self.turn_counter, (battler, effect)
                     )
-                    return battler, effect
+                    return None
                 applied_effect = self.apply_effect(caster, battler, effect, rng)
                 if applied_effect is None:
                     return None
@@ -1031,7 +1034,7 @@ class BattleBundle:
                     self.effects.append(
                         effect.delay + self.turn_counter, (None, effect)
                     )
-                    return None, effect
+                    return None
                 applied_effect = self.apply_effect(caster, None, effect, rng)
                 if applied_effect is None:
                     return None
@@ -1106,7 +1109,9 @@ class BattleBundle:
             return known_effects
         request = (
             "The player plays the following cards, in order:\n"
-            + "\n".join(f"- {card.name}: {card.description}" for card in cards)
+            + "\n".join(
+                f"- {card.short_id()}: {card.name}: {card.description}" for card in cards
+            )
             + "\nResolve their effects with tool calls, then call finish_resolution."
         )
         resolved, _reason = self.harness.resolve(request, enemy_mode=False)

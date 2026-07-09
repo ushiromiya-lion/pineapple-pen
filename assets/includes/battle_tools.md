@@ -9,7 +9,7 @@ Rules:
   pre-multiply or pre-reduce an amount because of a status.
 - R2. Target and source names must exactly match the battler names shown in the
   state snapshot.
-- R3. Card arguments use the short ids shown in the Hand list.
+- R3. Card arguments use the short ids shown in the Hand or Resolving lists.
 - R4. Prefer issuing all tool calls for a resolution in one single response
   (they execute in order), ending with finish_resolution.
 - R5. finish_resolution.reason is 1-3 sentences of vivid but concise narration
@@ -26,3 +26,5 @@ Rules:
   enemy's exact name>.
 - R10. Play both sides fairly: resolve what the cards and intents actually say,
   no more and no less.
+- R11. Resolve separate hits as separate deal_damage calls. For example, a
+  "2x4 damage" effect is two deal_damage calls for 4, not one call for 8.

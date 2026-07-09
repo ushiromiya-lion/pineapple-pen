@@ -134,6 +134,10 @@ class ToolLoopSession:
             model=self.model, contents=self.history, config=config
         )
 
+    def reset_history(self) -> None:
+        self.history = []
+        self._pending_responses = []
+
     def _payload_from_output(self, output: dict) -> dict:
         if "output" in output or "error" in output:
             return output
@@ -154,7 +158,6 @@ class ToolLoopSession:
 
     def _handle_calls(self, calls: list[types.FunctionCall]) -> _CallBatchResult:
         response_parts = []
-        terminal_name = self._terminal_name()
         terminal_handled = False
         terminal_args = None
         terminal_output = None
@@ -175,13 +178,14 @@ class ToolLoopSession:
                         payload = self._invoke_tool(spec, dict(call.args or {}))
                     except ToolError as exc:
                         payload = {"error": str(exc)}
+                    except Exception as exc:
+                        logger.exception("tool handler failed", tool=name)
+                        payload = {"error": f"internal tool error: {exc}"}
                     if spec.terminal and "error" not in payload:
                         terminal_handled = True
                         terminal_succeeded = True
                         terminal_args = dict(call.args or {})
                         terminal_output = payload.get("output", payload)
-                    elif name == terminal_name:
-                        terminal_handled = True
             response_parts.append(self._call_response(name, payload))
 
         return _CallBatchResult(
@@ -218,6 +222,24 @@ class ToolLoopSession:
 
         for turn in range(1, max_model_turns + 1):
             resp = self._generate()
+            if not resp.candidates or resp.candidates[0].content is None:
+                self.history.append(
+                    types.Content(
+                        role="user",
+                        parts=[
+                            types.Part(
+                                text=(
+                                    "The model response was empty or blocked. "
+                                    f"Call {terminal_name} to end the resolution."
+                                )
+                            )
+                        ],
+                    )
+                )
+                consecutive_error_turns += 1
+                if consecutive_error_turns >= max_error_turns:
+                    break
+                continue
             self.history.append(resp.candidates[0].content)
             calls = resp.function_calls or []
             if not calls:
@@ -271,6 +293,13 @@ class ToolLoopSession:
             )
         )
         resp = self._generate(allowed=[terminal_name])
+        if not resp.candidates or resp.candidates[0].content is None:
+            self.status = LoopStatus.DONE
+            return TurnResult(
+                completed=False,
+                model_turns=max_model_turns + 1,
+                forced=True,
+            )
         self.history.append(resp.candidates[0].content)
         calls = resp.function_calls or []
         terminal_calls = [call for call in calls if call.name == terminal_name]
@@ -286,6 +315,21 @@ class ToolLoopSession:
                     model_turns=max_model_turns + 1,
                     forced=True,
                 )
+            self.history.append(types.Content(role="user", parts=batch.response_parts))
+        elif calls:
+            response_parts = [
+                self._call_response(
+                    call.name or "",
+                    {
+                        "error": (
+                            f"forced finish only allows {terminal_name}; "
+                            "this call was ignored"
+                        )
+                    },
+                )
+                for call in calls
+            ]
+            self.history.append(types.Content(role="user", parts=response_parts))
 
         self.status = LoopStatus.DONE
         return TurnResult(
