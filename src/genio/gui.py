@@ -1110,10 +1110,12 @@ class PlayerChoiceOverlay:
         return self.request.cards[self.page : self.page + self.CARD_PAGE_SIZE]
 
     def _confirm_rect(self) -> tuple[int, int, int, int]:
-        return WINDOW_WIDTH - 90, WINDOW_HEIGHT - 27, 72, 17
+        if self._choice_kind() == "hand":
+            return WINDOW_WIDTH // 2 - 72, 150, 144, 20
+        return WINDOW_WIDTH // 2 - 72, WINDOW_HEIGHT - 30, 144, 20
 
     def _skip_rect(self) -> tuple[int, int, int, int]:
-        return 18, WINDOW_HEIGHT - 27, 52, 17
+        return 18, WINDOW_HEIGHT - 30, 52, 20
 
     def _prev_rect(self) -> tuple[int, int, int, int]:
         return 16, 102, 18, 30
@@ -1323,13 +1325,10 @@ class PlayerChoiceOverlay:
         for card, x, y, w, h in self._card_browser_rects():
             selected = card.short_id() in self.selected
             hovering = _in_rect(x, y, w, h)
-            if selected:
-                self._draw_selection_frame(x, y, w, h, 10)
-            elif hovering:
-                self._draw_selection_frame(x, y, w, h, 7)
+            draw_y = y - (3 if hovering else 0)
             pyxel.blt(
                 x,
-                y - (3 if hovering else 0),
+                draw_y,
                 self.scene.card_printer.print_card(card),
                 0,
                 0,
@@ -1338,8 +1337,9 @@ class PlayerChoiceOverlay:
                 colkey=254,
             )
             if selected:
-                pyxel.circ(x + w - 6, y + 6, 5, 10)
-                retro_text(x + w - 10, y + 3, "*", 0, layout=layout(w=8, ha="center"))
+                self._draw_selected_card_mark(x, draw_y, w, h)
+            elif hovering:
+                self._draw_selection_frame(x, draw_y, w, h, 7)
             retro_text(
                 x, y + h + 4, card.short_id(), 13, layout=layout(w=w, ha="center")
             )
@@ -1352,31 +1352,22 @@ class PlayerChoiceOverlay:
         for sprite in self._hand_option_sprites():
             selected = sprite.card.short_id() in self.selected
             hovering = sprite.is_mouse_over()
+            x, y = int(sprite.x), int(sprite.y)
             if selected:
-                self._draw_selection_frame(
-                    int(sprite.x), int(sprite.y), sprite.width, sprite.height, 10
-                )
+                self._draw_selected_card_mark(x, y, sprite.width, sprite.height)
             elif hovering:
-                self._draw_selection_frame(
-                    int(sprite.x), int(sprite.y), sprite.width, sprite.height, 7
-                )
+                self._draw_selection_frame(x, y, sprite.width, sprite.height, 7)
             else:
-                self._draw_selection_frame(
-                    int(sprite.x), int(sprite.y), sprite.width, sprite.height, 5
-                )
-        retro_text(
-            0,
-            WINDOW_HEIGHT - 54,
-            "Choose directly from your hand",
-            13,
-            layout=layout(w=WINDOW_WIDTH, ha="center"),
-        )
+                self._draw_selection_frame(x, y, sprite.width, sprite.height, 5)
 
     def _draw_targets(self) -> None:
         for target, x, y, w, h in self._target_sprite_rects():
             selected = target.name in self.selected
             hovering = _in_rect(x, y, w, h)
             color = 10 if selected else 7 if hovering else 5
+            if selected:
+                with dithering(0.25):
+                    pyxel.rect(x, y, w, h, 10)
             self._draw_selection_frame(x, y, w, h, color)
             pyxel.line(x + w // 2 - 8, y + h // 2, x + w // 2 + 8, y + h // 2, color)
             pyxel.line(x + w // 2, y + h // 2 - 8, x + w // 2, y + h // 2 + 8, color)
@@ -1391,7 +1382,21 @@ class PlayerChoiceOverlay:
     def _draw_footer_actions(self) -> None:
         if self.request.min_count == 0:
             self._draw_text_button(self._skip_rect(), "Skip", True)
-        self._draw_text_button(self._confirm_rect(), "Confirm", self.selection_valid())
+        self._draw_text_button(
+            self._confirm_rect(),
+            "Confirm Selection"
+            if self.selection_valid()
+            else self._selection_need_text(),
+            self.selection_valid(),
+        )
+
+    def _selection_need_text(self) -> str:
+        if len(self.selected) < self.request.min_count:
+            remaining = self.request.min_count - len(self.selected)
+            noun = "Card" if isinstance(self.request, ChooseCardsRequest) else "Target"
+            suffix = "" if remaining == 1 else "s"
+            return f"Select {remaining} {noun}{suffix}"
+        return "Too Many Selected"
 
     def _draw_page_button(self, rect: tuple[int, int, int, int], label: str) -> None:
         self._draw_text_button(rect, label, True)
@@ -1414,6 +1419,23 @@ class PlayerChoiceOverlay:
         pulse = 1 + int(sin_01(self.reason_timer, 0.18) * 2)
         pyxel.rectb(x - 3, y - 3, w + 6, h + 6, color)
         pyxel.rectb(x - pulse, y - pulse, w + pulse * 2, h + pulse * 2, 7)
+
+    def _draw_selected_card_mark(self, x: int, y: int, w: int, h: int) -> None:
+        with dithering(0.28):
+            pyxel.rect(x, y, w, h, 10)
+        self._draw_selection_frame(x, y, w, h, 10)
+        pyxel.rect(x + 5, y + h - 17, w - 10, 12, 10)
+        pyxel.rectb(x + 5, y + h - 17, w - 10, 12, 7)
+        retro_text(
+            x + 5,
+            y + h - 14,
+            "SELECTED",
+            7,
+            layout=layout(w=w - 10, ha="center"),
+        )
+        pyxel.circ(x + w - 7, y + 7, 6, 10)
+        pyxel.circ(x + w - 7, y + 7, 4, 7)
+        retro_text(x + w - 11, y + 4, "*", 0, layout=layout(w=8, ha="center"))
 
 
 class ResolvingSide(Enum):
