@@ -14,6 +14,8 @@ cards = [
     "Defend * 4 # Gain 5 Block.",
     "D[Bash] * 1 # @prefix 4 8 cost 1",
     "Letter Replacer * 1 # @cost 0",
+    "Dev Rummage * 2 # Choose 2 cards in your hand to discard. Draw 2 cards.",
+    "Dev Recover * 2 # Choose a card in your discard pile. Put it on top of your deck, then draw 1 card.",
 ]
 
 
