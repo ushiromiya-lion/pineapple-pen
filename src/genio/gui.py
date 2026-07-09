@@ -25,6 +25,10 @@ from genio.battle import (
     MainSceneLike,
     ResolvedEffects,
 )
+from genio.battle_harness import (
+    ChooseCardsRequest,
+    PlayerChoiceRequest,
+)
 from genio.card import Card
 from genio.components import (
     CanAddAnim,
@@ -1063,6 +1067,178 @@ class ImageButton:
         return False
 
 
+def _in_rect(x: int, y: int, w: int, h: int) -> bool:
+    return x <= pyxel.mouse_x <= x + w and y <= pyxel.mouse_y <= y + h
+
+
+class PlayerChoiceOverlay:
+    def __init__(self, scene: MainScene, request: PlayerChoiceRequest) -> None:
+        self.scene = scene
+        self.request = request
+        self.selected: set[str] = set()
+        self.page = 0
+        self.submission: dict | None = None
+        self.reason_timer = 0
+
+    @property
+    def options(self) -> list[Card] | list[EnemyBattler]:
+        if isinstance(self.request, ChooseCardsRequest):
+            return self.request.cards
+        return self.request.candidates
+
+    def _option_id(self, option: Card | EnemyBattler) -> str:
+        if isinstance(option, Card):
+            return option.short_id()
+        return option.name
+
+    def _option_title(self, option: Card | EnemyBattler) -> str:
+        if isinstance(option, Card):
+            return option.name
+        return option.name
+
+    def _visible_options(self) -> list[Card] | list[EnemyBattler]:
+        return self.options[self.page : self.page + 3]
+
+    def _slot_rect(self, index: int) -> tuple[int, int, int, int]:
+        return 68 + index * 100, 94, 88, 58
+
+    def _confirm_rect(self) -> tuple[int, int, int, int]:
+        return 304, 172, 58, 16
+
+    def _skip_rect(self) -> tuple[int, int, int, int]:
+        return 64, 172, 44, 16
+
+    def _prev_rect(self) -> tuple[int, int, int, int]:
+        return 58, 126, 18, 18
+
+    def _next_rect(self) -> tuple[int, int, int, int]:
+        return 350, 126, 18, 18
+
+    def selection_valid(self) -> bool:
+        return self.request.min_count <= len(self.selected) <= self.request.max_count
+
+    def _toggle(self, option: Card | EnemyBattler) -> None:
+        option_id = self._option_id(option)
+        if option_id in self.selected:
+            self.selected.remove(option_id)
+            return
+        if self.request.max_count == 1:
+            self.selected.clear()
+        if len(self.selected) < self.request.max_count:
+            self.selected.add(option_id)
+
+    def _submit(self) -> None:
+        if not self.selection_valid():
+            return
+        if isinstance(self.request, ChooseCardsRequest):
+            self.submission = {"card_ids": list(self.selected)}
+        else:
+            self.submission = {"targets": list(self.selected)}
+
+    def update(self) -> None:
+        self.reason_timer += 1
+        if pyxel.btnp(pyxel.KEY_LEFT):
+            self.page = max(0, self.page - 3)
+        if pyxel.btnp(pyxel.KEY_RIGHT):
+            self.page = min(max(len(self.options) - 3, 0), self.page + 3)
+        for key, index in HAND_SELECT_KEYS[:3]:
+            if pyxel.btnp(key):
+                visible = self._visible_options()
+                if index < len(visible):
+                    self._toggle(visible[index])
+        if pyxel.btnp(pyxel.KEY_RETURN) or pyxel.btnp(pyxel.KEY_KP_ENTER):
+            self._submit()
+        if self.request.min_count == 0 and pyxel.btnp(pyxel.KEY_ESCAPE):
+            self.selected.clear()
+            self._submit()
+        if not pyxel.btnr(pyxel.MOUSE_BUTTON_LEFT):
+            return
+        for index, option in enumerate(self._visible_options()):
+            if _in_rect(*self._slot_rect(index)):
+                self._toggle(option)
+                return
+        if self.page > 0 and _in_rect(*self._prev_rect()):
+            self.page = max(0, self.page - 3)
+            return
+        if self.page + 3 < len(self.options) and _in_rect(*self._next_rect()):
+            self.page += 3
+            return
+        if self.request.min_count == 0 and _in_rect(*self._skip_rect()):
+            self.selected.clear()
+            self._submit()
+            return
+        if _in_rect(*self._confirm_rect()):
+            self._submit()
+
+    def take_submission(self) -> dict | None:
+        submission = self.submission
+        self.submission = None
+        return submission
+
+    def draw(self) -> None:
+        x, y, w, h = 48, 42, 331, 154
+        with dithering(0.35):
+            pyxel.rect(0, 0, WINDOW_WIDTH, WINDOW_HEIGHT, 0)
+        draw_rounded_rectangle(x, y, w, h, 4, 1)
+        pyxel.rectb(x, y, w, h, 7)
+        if self.request.reason:
+            visible_chars = min(len(self.request.reason), 24 + self.reason_timer // 2)
+            retro_text(
+                x + 12,
+                y + 10,
+                self.request.reason[:visible_chars],
+                13,
+                layout=layout(w=w - 24, h=20, ha="center"),
+            )
+        shadowed_text(
+            x + 12,
+            y + 34,
+            self.request.prompt,
+            7,
+            layout(w=w - 24, h=18, ha="center", va="center"),
+        )
+        counter = f"({len(self.selected)}/{self.request.max_count})"
+        retro_text(x + w - 54, y + 56, counter, 7, layout=layout(w=44, ha="right"))
+
+        for index, option in enumerate(self._visible_options()):
+            sx, sy, sw, sh = self._slot_rect(index)
+            option_id = self._option_id(option)
+            selected = option_id in self.selected
+            draw_rounded_rectangle(sx, sy, sw, sh, 3, 5 if selected else 0)
+            pyxel.rectb(sx, sy, sw, sh, 10 if selected else 7)
+            retro_text(
+                sx + 5,
+                sy + 8,
+                option_id,
+                13,
+                layout=layout(w=sw - 10, ha="center"),
+            )
+            retro_text(
+                sx + 5,
+                sy + 24,
+                self._option_title(option),
+                7,
+                layout=layout(w=sw - 10, h=24, ha="center", va="center"),
+            )
+
+        if self.page > 0:
+            px, py, pw, ph = self._prev_rect()
+            draw_rounded_rectangle(px, py, pw, ph, 3, 0)
+            retro_text(px, py + 4, "<", 7, layout=layout(w=pw, ha="center"))
+        if self.page + 3 < len(self.options):
+            nx, ny, nw, nh = self._next_rect()
+            draw_rounded_rectangle(nx, ny, nw, nh, 3, 0)
+            retro_text(nx, ny + 4, ">", 7, layout=layout(w=nw, ha="center"))
+
+        if self.request.min_count == 0:
+            sx, sy, sw, sh = self._skip_rect()
+            draw_rounded_rectangle(sx, sy, sw, sh, 3, 0)
+            retro_text(sx, sy + 4, "Skip", 7, layout=layout(w=sw, ha="center"))
+        cx, cy, cw, ch = self._confirm_rect()
+        draw_rounded_rectangle(cx, cy, cw, ch, 3, 5 if self.selection_valid() else 13)
+        retro_text(cx, cy + 4, "Confirm", 7, layout=layout(w=cw, ha="center"))
+
+
 class ResolvingSide(Enum):
     PLAYER = 0
     ENEMY = 1
@@ -1183,6 +1359,8 @@ class MainScene(Scene):
         self.letter_replacer_card: Card | None = None
         self.letter_replacer_target_id: str | None = None
         self.letter_replacer_letter_index: int | None = None
+        self.choice_overlay: PlayerChoiceOverlay | None = None
+        self.choice_reasons: list[str] = []
         self.buffer = pyxel.Image(427, 240)
         self.framing = ResolvingFraming(self)
         self.framing.rarity = 2
@@ -1251,6 +1429,8 @@ class MainScene(Scene):
         ]
 
     def can_resolve_new_cards(self) -> bool:
+        if self.choice_overlay:
+            return False
         if self.letter_replacer_card:
             return False
         selected_cards = [card for card in self.card_sprites if card.selected]
@@ -1269,7 +1449,7 @@ class MainScene(Scene):
         )
 
     def can_end_player_turn(self) -> bool:
-        return not self.futures
+        return not self.futures and self.choice_overlay is None
 
     def on_new_event(self, ev: str, *others: Any) -> None:
         self.sync_sprites(ev, *others)
@@ -1294,7 +1474,9 @@ class MainScene(Scene):
                 self.wait_anim_countdown = 0
             else:
                 self.wait_anim_countdown -= 1
-        input_mode_active = self.update_letter_replacer_input()
+        input_mode_active = self.update_choice_overlay()
+        if not input_mode_active:
+            input_mode_active = self.update_letter_replacer_input()
         if not input_mode_active:
             input_mode_active = self.update_prefix_card_input()
         if not input_mode_active:
@@ -1377,6 +1559,7 @@ class MainScene(Scene):
         self.check_mailbox()
         self.check_prefix_mailbox()
         self.check_letter_replacement_mailbox()
+        self.update_choice_overlay()
         self.update_buttons_state()
         self.tweens_signpost.update()
         self.background_video.update()
@@ -1397,7 +1580,7 @@ class MainScene(Scene):
 
     def update_buttons_state(self):
         selected_cards = [card for card in self.card_sprites if card.selected]
-        if self.letter_replacer_card:
+        if self.choice_overlay or self.futures or self.letter_replacer_card:
             self.play_button.state = ImageButtonState.DISABLED
             self.end_button.state = ImageButtonState.DISABLED
             return
@@ -1417,6 +1600,20 @@ class MainScene(Scene):
 
     def schedule_in(self, delay: int, fn: Callable[[], None]) -> None:
         self.tweener.append(range(delay), Instant(fn))
+
+    def update_choice_overlay(self) -> bool:
+        if self.choice_overlay is not None:
+            self.choice_overlay.update()
+            if submission := self.choice_overlay.take_submission():
+                if self.choice_overlay.request.reason:
+                    self.choice_reasons.append(self.choice_overlay.request.reason)
+                self.bundle.harness.submit_choice(submission)
+                self.choice_overlay = None
+            return True
+        if self.futures and (choice := self.bundle.harness.pending_choice) is not None:
+            self.choice_overlay = PlayerChoiceOverlay(self, choice)
+            return True
+        return False
 
     def update_hand_selection_shortcuts(self) -> None:
         for key, index in HAND_SELECT_KEYS:
@@ -1767,6 +1964,9 @@ class MainScene(Scene):
         if used_framing:
             self.framing.on_rarity_determined(effects.rarity)
         self.play_effects(effects)
+        for reason in self.choice_reasons:
+            self.bundle.battle_logs.append(f"Turn {self.bundle.turn_counter}: {reason}")
+        self.choice_reasons.clear()
         self.bundle.record_to_battle_logs(effects)
         if used_framing:
             self.schedule_in(30, lambda: self.framing.teardown())
@@ -1839,9 +2039,12 @@ class MainScene(Scene):
 
     def request_next_scene(self) -> str | None:
         if pyxel.btnp(pyxel.KEY_Q):
+            self.bundle.harness.abort_pending()
             return "genio.scene_booster"
 
     def should_all_cards_disabled(self) -> bool:
+        if self.choice_overlay or self.futures:
+            return True
         if self.bundle.card_bundle.resolving:
             return True
         return self.zero_energy_timer > 30
@@ -1927,6 +2130,8 @@ class MainScene(Scene):
             popup.draw()
         self.draw_hud()
         self.framing.draw()
+        if self.choice_overlay:
+            self.choice_overlay.draw()
         for scene in self.subscenes:
             scene.draw()
         if self.config_button.btnp and not self.subscenes:

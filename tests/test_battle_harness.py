@@ -1,7 +1,11 @@
+import threading
+import time
+
 from genio.battle import setup_battle_bundle
 from genio.battle_commands import ApplyStatus
-from genio.battle_harness import BattleToolHarness
+from genio.battle_harness import BattleToolHarness, ChooseCardsRequest
 from genio.card import Card
+from genio.core.toolloop import LoopStatus
 from genio.effect import ModifyAmount, OnDamageDealt, StatusDefinition
 from toolloop_fakes import fc_part, model_turn, scripted
 
@@ -12,6 +16,14 @@ def make_bundle():
 
 def response_payloads(content):
     return [part.function_response.response for part in content.parts]
+
+
+def wait_for_choice(harness: BattleToolHarness):
+    deadline = time.monotonic() + 2
+    while harness.pending_choice is None and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert harness.pending_choice is not None
+    return harness.pending_choice
 
 
 def test_simple_attack_one_round_trip():
@@ -405,6 +417,243 @@ def test_delayed_commands_are_queued_not_reported_as_applied():
     flushed = bundle.flush_expired_effects(bundle.rng)
     assert flushed.total_damage() == 4
     assert enemy.hp == enemy.max_hp - 4
+
+
+def test_choose_cards_discard_two_draw_two_end_to_end():
+    bundle = make_bundle()
+    chosen = bundle.card_bundle.hand[:2]
+    ask_response = {}
+
+    def generate_fn(*, contents, config):
+        if len(contents) == 1:
+            return model_turn(
+                fc_part(
+                    "ask_player_choose_cards",
+                    {
+                        "prompt": "Choose 2 cards to discard.",
+                        "reason": "The room tightens around your grip.",
+                        "zone": "hand",
+                        "min_count": 2,
+                        "max_count": 2,
+                    },
+                )
+            )
+        ask_response.update(contents[-1].parts[0].function_response.response["output"])
+        return model_turn(
+            fc_part(
+                "discard_cards",
+                {"card_ids": [card["id"] for card in ask_response["cards"]]},
+            ),
+            fc_part("draw_cards", {"count": 2}),
+            fc_part("finish_resolution", {"reason": "discarded and drew", "significance": 1}),
+        )
+
+    harness = BattleToolHarness(bundle, generate_fn=generate_fn)
+    thread = threading.Thread(target=lambda: harness.resolve("resolve", enemy_mode=False))
+    thread.start()
+
+    request = wait_for_choice(harness)
+    assert isinstance(request, ChooseCardsRequest)
+    assert request.min_count == 2
+    assert request.max_count == 2
+    harness.submit_choice({"card_ids": [card.short_id() for card in chosen]})
+    thread.join(timeout=2)
+
+    assert not thread.is_alive()
+    assert ask_response["cards"] == [
+        {"id": chosen[0].short_id(), "name": chosen[0].name},
+        {"id": chosen[1].short_id(), "name": chosen[1].name},
+    ]
+    assert all(card in bundle.card_bundle.graveyard for card in chosen)
+
+
+def test_choose_cards_zero_options_short_circuits_without_suspension():
+    bundle = make_bundle()
+    seen_response = {}
+    harness = BattleToolHarness(
+        bundle,
+        generate_fn=scripted(
+            [
+                model_turn(
+                    fc_part(
+                        "ask_player_choose_cards",
+                        {
+                            "prompt": "Choose a card from discard.",
+                            "zone": "graveyard",
+                            "min_count": 1,
+                            "max_count": 1,
+                        },
+                    )
+                ),
+                model_turn(
+                    fc_part("finish_resolution", {"reason": "nothing", "significance": 1})
+                ),
+            ]
+        ),
+    )
+
+    harness.resolve("resolve", enemy_mode=False)
+    seen_response.update(response_payloads(harness.session.history[2])[0]["output"])
+
+    assert seen_response == {
+        "card_ids": [],
+        "cards": [],
+        "note": "no cards available to choose",
+    }
+    assert harness.session.status == LoopStatus.DONE
+
+
+def test_choose_cards_clamps_min_to_available_options():
+    bundle = make_bundle()
+    only_card = bundle.card_bundle.hand[0]
+    bundle.card_bundle.hand = [only_card]
+    harness = BattleToolHarness(
+        bundle,
+        generate_fn=scripted(
+            [
+                model_turn(
+                    fc_part(
+                        "ask_player_choose_cards",
+                        {
+                            "prompt": "Choose 2 cards.",
+                            "zone": "hand",
+                            "min_count": 2,
+                            "max_count": 2,
+                        },
+                    )
+                ),
+                model_turn(
+                    fc_part("finish_resolution", {"reason": "done", "significance": 1})
+                ),
+            ]
+        ),
+    )
+    thread = threading.Thread(target=lambda: harness.resolve("resolve", enemy_mode=False))
+    thread.start()
+
+    request = wait_for_choice(harness)
+    assert isinstance(request, ChooseCardsRequest)
+    assert request.min_count == 1
+    assert request.max_count == 1
+    harness.submit_choice({"card_ids": [only_card.short_id()]})
+    thread.join(timeout=2)
+
+    assert not thread.is_alive()
+
+
+def test_choose_cards_excludes_staged_consumed_cards():
+    bundle = make_bundle()
+    consumed = bundle.card_bundle.hand[0]
+    harness = BattleToolHarness(
+        bundle,
+        generate_fn=scripted(
+            [
+                model_turn(
+                    fc_part("destroy_card", {"card_ids": [consumed.short_id()]}),
+                    fc_part(
+                        "ask_player_choose_cards",
+                        {
+                            "prompt": "Choose any remaining card.",
+                            "zone": "hand",
+                            "min_count": 0,
+                            "max_count": 1,
+                        },
+                    ),
+                ),
+                model_turn(
+                    fc_part("finish_resolution", {"reason": "done", "significance": 1})
+                ),
+            ]
+        ),
+    )
+    thread = threading.Thread(target=lambda: harness.resolve("resolve", enemy_mode=False))
+    thread.start()
+
+    request = wait_for_choice(harness)
+    assert isinstance(request, ChooseCardsRequest)
+    assert consumed.short_id() not in {card.short_id() for card in request.cards}
+    harness.submit_choice({"card_ids": []})
+    thread.join(timeout=2)
+
+    assert not thread.is_alive()
+
+
+def test_abort_pending_choice_returns_repairable_error():
+    bundle = make_bundle()
+    harness = BattleToolHarness(
+        bundle,
+        generate_fn=scripted(
+            [
+                model_turn(
+                    fc_part(
+                        "ask_player_choose_cards",
+                        {
+                            "prompt": "Choose a card.",
+                            "zone": "hand",
+                            "min_count": 1,
+                            "max_count": 1,
+                        },
+                    )
+                ),
+                model_turn(
+                    fc_part("finish_resolution", {"reason": "recovered", "significance": 1})
+                ),
+            ]
+        ),
+    )
+    thread = threading.Thread(target=lambda: harness.resolve("resolve", enemy_mode=False))
+    thread.start()
+
+    wait_for_choice(harness)
+    harness.abort_pending()
+    thread.join(timeout=2)
+
+    assert not thread.is_alive()
+    assert response_payloads(harness.session.history[2]) == [
+        {"error": "player cancelled the choice"}
+    ]
+
+
+def test_interrupt_turn_does_not_consume_error_budget():
+    bundle = make_bundle()
+    card = bundle.card_bundle.hand[0]
+    harness = BattleToolHarness(
+        bundle,
+        generate_fn=scripted(
+            [
+                model_turn(
+                    fc_part(
+                        "ask_player_choose_cards",
+                        {
+                            "prompt": "Choose a card.",
+                            "zone": "hand",
+                            "min_count": 1,
+                            "max_count": 1,
+                        },
+                    )
+                ),
+                model_turn(
+                    fc_part("finish_resolution", {"reason": "done", "significance": 1})
+                ),
+            ]
+        ),
+    )
+    thread = threading.Thread(
+        target=lambda: harness.resolve(
+            "resolve",
+            enemy_mode=False,
+            max_model_turns=2,
+            max_error_turns=1,
+        )
+    )
+    thread.start()
+
+    wait_for_choice(harness)
+    harness.submit_choice({"card_ids": [card.short_id()]})
+    thread.join(timeout=2)
+
+    assert not thread.is_alive()
+    assert harness.session.status == LoopStatus.DONE
 
 
 def test_resolve_enemy_actions_uses_harness():

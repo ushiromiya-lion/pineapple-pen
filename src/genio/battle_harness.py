@@ -26,7 +26,13 @@ from genio.battle_commands import (
 from genio.card import Card
 from genio.core.base import jinja_env
 from genio.core.llm import GEMINI_MODEL, SAFETY_SETTINGS
-from genio.core.toolloop import ToolError, ToolLoopSession, ToolSpec
+from genio.core.toolloop import (
+    LoopStatus,
+    PendingInput,
+    ToolError,
+    ToolLoopSession,
+    ToolSpec,
+)
 from genio.effect import (
     Advisory,
     DealDamageToSelf,
@@ -48,6 +54,27 @@ if TYPE_CHECKING:
     from genio.battle import BattleBundle, Battler, ResolvedEffects
 
 logger = get_logger()
+
+
+@dataclass(frozen=True)
+class ChooseCardsRequest:
+    prompt: str
+    reason: str
+    cards: list[Card]
+    min_count: int
+    max_count: int
+
+
+@dataclass(frozen=True)
+class ChooseTargetsRequest:
+    prompt: str
+    reason: str
+    candidates: list[Battler]
+    min_count: int
+    max_count: int
+
+
+PlayerChoiceRequest = ChooseCardsRequest | ChooseTargetsRequest
 
 
 def _s(schema_type: str, desc: str = "", **kwargs) -> types.Schema:
@@ -84,6 +111,7 @@ WHERE = _s(
     "Destination zone.",
     enum=["deck_top", "deck", "hand", "graveyard"],
 )
+CHOICE_ZONE = _s("STRING", "Choice source zone.", enum=["hand", "graveyard", "deck"])
 DURATION_TYPE = _s("STRING", "Duration unit.", enum=["turns", "times"])
 TRIGGER = _s(
     "STRING",
@@ -235,6 +263,42 @@ def _tool_declarations() -> list[types.FunctionDeclaration]:
             ["rule_id"],
         ),
         _decl(
+            "ask_player_choose_cards",
+            "Ask the player to choose cards before continuing resolution.",
+            {
+                "prompt": _s("STRING", "Mechanical instruction shown to the player."),
+                "reason": _s(
+                    "STRING",
+                    (
+                        "One short sentence of in-world narration shown to the "
+                        "player; match the battle's tone."
+                    ),
+                ),
+                "zone": CHOICE_ZONE,
+                "min_count": _s("INTEGER", "Minimum cards to choose.", minimum=0),
+                "max_count": _s("INTEGER", "Maximum cards to choose.", minimum=1),
+            },
+            ["prompt", "min_count", "max_count"],
+        ),
+        _decl(
+            "ask_player_choose_targets",
+            "Ask the player to choose battler targets before continuing resolution.",
+            {
+                "prompt": _s("STRING", "Mechanical instruction shown to the player."),
+                "reason": _s(
+                    "STRING",
+                    (
+                        "One short sentence of in-world narration shown to the "
+                        "player; match the battle's tone."
+                    ),
+                ),
+                "candidates": _array(_s("STRING"), "Exact candidate battler names."),
+                "min_count": _s("INTEGER", "Minimum targets to choose.", minimum=0),
+                "max_count": _s("INTEGER", "Maximum targets to choose.", minimum=1),
+            },
+            ["prompt"],
+        ),
+        _decl(
             "finish_resolution",
             "Commit staged commands and finish this resolution.",
             {
@@ -289,6 +353,8 @@ class BattleToolHarness:
             "transform_card": self._h_transform_card,
             "destroy_card": self._h_destroy_card,
             "destroy_rule": self._h_destroy_rule,
+            "ask_player_choose_cards": self._h_ask_choose_cards,
+            "ask_player_choose_targets": self._h_ask_choose_targets,
             "finish_resolution": self._h_finish,
         }
         specs = []
@@ -393,6 +459,20 @@ class BattleToolHarness:
         if where not in {"deck_top", "deck", "hand", "graveyard"}:
             raise ToolError('"where" must be deck_top, deck, hand, or graveyard')
         return where
+
+    def _choice_counts(self, args: dict) -> tuple[int, int]:
+        min_count = self._int(args, "min_count", 0, 99, default=1)
+        max_count = self._int(args, "max_count", 1, 99, default=1)
+        if min_count > max_count:
+            raise ToolError('"min_count" must be less than or equal to "max_count"')
+        return min_count, max_count
+
+    def _choice_text(self, args: dict) -> tuple[str, str]:
+        prompt = " ".join(str(self._req(args, "prompt")).split())[:100]
+        reason = " ".join(str(args.get("reason", "")).split())[:100]
+        if not prompt:
+            raise ToolError('"prompt" must not be empty')
+        return prompt, reason
 
     def _trigger(self, trigger: str | None) -> StatusTrigger | None:
         if trigger is None:
@@ -662,6 +742,87 @@ class BattleToolHarness:
         self._stage(command, None)
         return self._echo(command)
 
+    def _choice_cards(self, zone: str) -> list[Card]:
+        match zone:
+            case "hand":
+                cards = self.bundle.card_bundle.hand
+            case "graveyard":
+                cards = self.bundle.card_bundle.graveyard
+            case "deck":
+                cards = self.bundle.card_bundle.deck
+            case _:
+                raise ToolError('"zone" must be hand, graveyard, or deck')
+        return [
+            card
+            for card in cards
+            if card.short_id() not in self._consumed_card_ids
+            and card.name.lower() not in self._consumed_card_names
+        ]
+
+    def _h_ask_choose_cards(self, args: dict) -> dict | PendingInput:
+        prompt, reason = self._choice_text(args)
+        min_count, max_count = self._choice_counts(args)
+        zone = str(args.get("zone", "hand"))
+        options = self._choice_cards(zone)
+        if not options:
+            return {"card_ids": [], "cards": [], "note": "no cards available to choose"}
+        max_count = min(max_count, len(options))
+        min_count = min(min_count, max_count)
+
+        def finalize(payload: dict) -> dict:
+            if payload.get("cancelled"):
+                raise ToolError("player cancelled the choice")
+            card_ids = [str(card_id).lower() for card_id in payload.get("card_ids", [])]
+            cards_by_id = {card.short_id(): card for card in options}
+            return {
+                "card_ids": card_ids,
+                "cards": [
+                    {"id": card_id, "name": cards_by_id[card_id].name}
+                    for card_id in card_ids
+                    if card_id in cards_by_id
+                ],
+            }
+
+        return PendingInput(
+            ChooseCardsRequest(
+                prompt=prompt,
+                reason=reason,
+                cards=options,
+                min_count=min_count,
+                max_count=max_count,
+            ),
+            finalize,
+        )
+
+    def _h_ask_choose_targets(self, args: dict) -> dict | PendingInput:
+        prompt, reason = self._choice_text(args)
+        min_count, max_count = self._choice_counts(args)
+        candidate_names = args.get("candidates")
+        if candidate_names:
+            candidates = [self._target(str(name)) for name in candidate_names]
+        else:
+            candidates = list(self.bundle.battlers())
+        if not candidates:
+            return {"targets": [], "note": "no targets available to choose"}
+        max_count = min(max_count, len(candidates))
+        min_count = min(min_count, max_count)
+
+        def finalize(payload: dict) -> dict:
+            if payload.get("cancelled"):
+                raise ToolError("player cancelled the choice")
+            return {"targets": [str(target) for target in payload.get("targets", [])]}
+
+        return PendingInput(
+            ChooseTargetsRequest(
+                prompt=prompt,
+                reason=reason,
+                candidates=candidates,
+                min_count=min_count,
+                max_count=max_count,
+            ),
+            finalize,
+        )
+
     def _commit(self, reason: str, significance: int):
         applied = []
         staged_count = len(self._staged)
@@ -731,7 +892,36 @@ class BattleToolHarness:
         )
         return "\n".join(lines)
 
-    def resolve(self, request: str, *, enemy_mode: bool) -> tuple[ResolvedEffects, str]:
+    @property
+    def pending_choice(self) -> PlayerChoiceRequest | None:
+        if self.session.status != LoopStatus.AWAITING_INPUT:
+            return None
+        pending = self.session.pending_input
+        if pending is None:
+            return None
+        request = pending.request
+        if isinstance(request, ChooseCardsRequest | ChooseTargetsRequest):
+            return request
+        return None
+
+    def submit_choice(self, payload: dict) -> None:
+        pending = self.session.pending_input
+        if pending is not None:
+            pending.fulfill(payload)
+
+    def abort_pending(self) -> None:
+        pending = self.session.pending_input
+        if pending is not None:
+            pending.fulfill({"cancelled": True})
+
+    def resolve(
+        self,
+        request: str,
+        *,
+        enemy_mode: bool,
+        max_model_turns: int = 8,
+        max_error_turns: int = 2,
+    ) -> tuple[ResolvedEffects, str]:
         with self._resolve_lock:
             self.session.history = []
             self._staged.clear()
@@ -743,7 +933,11 @@ class BattleToolHarness:
             self._last_resolved = None
             self._last_reason = ""
             message = self._snapshot() + "\n\n" + request
-            self.session.run_turn(message)
+            self.session.run_turn(
+                message,
+                max_model_turns=max_model_turns,
+                max_error_turns=max_error_turns,
+            )
             if self._last_resolved is None:
                 resolved, _ = self._commit(
                     "(resolution aborted; applying staged commands)",

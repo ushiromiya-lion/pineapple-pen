@@ -22,8 +22,11 @@ class ToolError(Exception):
 class PendingInput:
     """Suspend the loop until an external party supplies the tool result."""
 
-    def __init__(self, request: Any) -> None:
+    def __init__(
+        self, request: Any, finalize: Callable[[dict], dict] | None = None
+    ) -> None:
         self.request = request
+        self._finalize = finalize
         self._event = threading.Event()
         self._value: dict | None = None
 
@@ -34,6 +37,8 @@ class PendingInput:
     def wait(self) -> dict:
         self._event.wait()
         assert self._value is not None
+        if self._finalize is not None:
+            return self._finalize(self._value)
         return self._value
 
 
