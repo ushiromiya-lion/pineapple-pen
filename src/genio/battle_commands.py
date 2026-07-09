@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal, TypeAlias
+from typing import TypeAlias
 
-from genio.card import Card
+from genio.card import Card, Zone
 from genio.effect import (
     CreateCardEffect,
     DestroyCardEffect,
@@ -13,6 +13,7 @@ from genio.effect import (
     DuplicateCardEffect,
     Effect,
     GlobalEffect,
+    MoveCardsEffect,
     SinglePointEffect,
     StatusDefinition,
     TransformCardEffect,
@@ -82,14 +83,20 @@ class CreateCard(CommandModifiers):
     name: str = ""
     description: str | None = None
     copies: int = 1
-    where: Literal["deck_top", "deck", "hand", "graveyard"] = "hand"
+    where: Zone = "hand"
 
 
 @dataclass(frozen=True)
 class DuplicateCard(CommandModifiers):
     card_id: str = ""
     copies: int = 1
-    where: Literal["deck_top", "deck", "hand", "graveyard"] = "hand"
+    where: Zone = "hand"
+
+
+@dataclass(frozen=True)
+class MoveCards(CommandModifiers):
+    card_ids: tuple[str, ...] = ()
+    where: Zone = "hand"
 
 
 @dataclass(frozen=True)
@@ -120,6 +127,7 @@ BattleCommand: TypeAlias = (
     | DiscardCards
     | CreateCard
     | DuplicateCard
+    | MoveCards
     | TransformCard
     | DestroyCard
     | DestroyRule
@@ -237,6 +245,12 @@ def command_from_global_effect(effect: GlobalEffect) -> BattleCommand:
                 where=duplicate.where,
                 **modifiers,
             )
+        case MoveCardsEffect(_) as move:
+            return MoveCards(
+                card_ids=tuple(card.short_id() for card in move.cards),
+                where=move.where,
+                **modifiers,
+            )
         case TransformCardEffect(_) as transform:
             return TransformCard(
                 card_id=transform.from_card.short_id(),
@@ -294,6 +308,12 @@ def effect_from_command(command: BattleCommand, context: CardContext) -> Effect:
             return DuplicateCardEffect(
                 card=context.seek_card(card_id),
                 copies=copies,
+                where=where,
+                **modifiers,
+            )
+        case MoveCards(card_ids=card_ids, where=where):
+            return MoveCardsEffect(
+                cards=[context.seek_card(card_id) for card_id in card_ids],
                 where=where,
                 **modifiers,
             )

@@ -10,7 +10,7 @@ from uuid import uuid4
 from parse import search
 from structlog import get_logger
 
-from genio.card import Card
+from genio.card import Card, Zone
 
 logger = get_logger()
 
@@ -179,7 +179,7 @@ class DiscardCardsEffect(GlobalEffect):
 @dataclass(eq=True, frozen=True)
 class CreateCardEffect(GlobalEffect):
     card: Card = field(default_factory=Card)
-    where: Literal["deck_top", "deck", "hand", "graveyard"] = "hand"
+    where: Zone = "hand"
     copies: int = 1
 
 
@@ -187,7 +187,13 @@ class CreateCardEffect(GlobalEffect):
 class DuplicateCardEffect(GlobalEffect):
     card: Card = field(default_factory=Card)
     copies: int = 1
-    where: Literal["deck_top", "deck", "hand", "graveyard"] = "hand"
+    where: Zone = "hand"
+
+
+@dataclass(eq=True, frozen=True)
+class MoveCardsEffect(GlobalEffect):
+    cards: list[Card] = field(default_factory=list)
+    where: Zone = "hand"
 
 
 @dataclass(eq=True, frozen=True)

@@ -20,10 +20,11 @@ from genio.battle_commands import (
     GainBlock,
     Heal,
     LoseBlock,
+    MoveCards,
     RemoveStatus,
     TransformCard,
 )
-from genio.card import Card
+from genio.card import ZONES, Card, Zone
 from genio.core.base import jinja_env
 from genio.core.llm import GEMINI_MODEL, SAFETY_SETTINGS
 from genio.core.toolloop import (
@@ -109,7 +110,7 @@ DELAY = _s("INTEGER", "Delay in turns.", minimum=0, maximum=3)
 WHERE = _s(
     "STRING",
     "Destination zone.",
-    enum=["deck_top", "deck", "hand", "graveyard"],
+    enum=list(ZONES),
 )
 CHOICE_ZONE = _s("STRING", "Choice source zone.", enum=["hand", "graveyard", "deck"])
 DURATION_TYPE = _s("STRING", "Duration unit.", enum=["turns", "times"])
@@ -241,6 +242,19 @@ def _tool_declarations() -> list[types.FunctionDeclaration]:
             ["card_id"],
         ),
         _decl(
+            "move_cards",
+            (
+                "Stage moving existing cards to another zone. Moves apply in "
+                "the order staged."
+            ),
+            {
+                "card_ids": _array(_s("STRING"), "Exact card ids."),
+                "to": WHERE,
+                "delay": DELAY,
+            },
+            ["card_ids", "to"],
+        ),
+        _decl(
             "transform_card",
             "Stage transforming an existing card.",
             {
@@ -331,6 +345,7 @@ class BattleToolHarness:
         self._staged: list[tuple[Battler | None, BattleCommand]] = []
         self._consumed_card_ids: set[str] = set()
         self._consumed_card_names: dict[str, str] = {}
+        self._staged_moves: dict[str, Zone] = {}
         self._default_caster: Battler | None = None
         self._enemy_mode = False
         self._last_resolved: ResolvedEffects | None = None
@@ -350,6 +365,7 @@ class BattleToolHarness:
             "discard_cards": self._h_discard_cards,
             "create_card": self._h_create_card,
             "duplicate_card": self._h_duplicate_card,
+            "move_cards": self._h_move_cards,
             "transform_card": self._h_transform_card,
             "destroy_card": self._h_destroy_card,
             "destroy_rule": self._h_destroy_rule,
@@ -454,9 +470,9 @@ class BattleToolHarness:
             raise ToolError('"duration_type" must be "turns" or "times"')
         return duration_type
 
-    def _where(self, args: dict) -> str:
-        where = str(args.get("where", "hand"))
-        if where not in {"deck_top", "deck", "hand", "graveyard"}:
+    def _where(self, args: dict, key: str = "where", default: Zone = "hand") -> Zone:
+        where = str(args.get(key, default))
+        if where not in ZONES:
             raise ToolError('"where" must be deck_top, deck, hand, or graveyard')
         return where
 
@@ -565,6 +581,9 @@ class BattleToolHarness:
                     remember(card_id)
             case TransformCard(card_id=card_id):
                 remember(card_id)
+            case MoveCards(card_ids=card_ids, where=where):
+                for card_id in card_ids:
+                    self._staged_moves[card_id] = where
 
     def _projection_note(self, command: BattleCommand, target: Battler | None) -> str:
         if not isinstance(command, DealDamage) or target is None:
@@ -716,6 +735,21 @@ class BattleToolHarness:
         self._stage(command, None)
         return self._echo(command)
 
+    def _h_move_cards(self, args: dict) -> dict:
+        cards = [self._card(str(card_id)) for card_id in self._req(args, "card_ids")]
+        where = self._where(args, key="to")
+        command = MoveCards(
+            card_ids=tuple(card.short_id() for card in cards),
+            where=where,
+            delay=self._int(args, "delay", 0, 3, default=0),
+        )
+        self._stage(command, None)
+        names = ", ".join(card.name for card in cards)
+        return {
+            **self._echo(command),
+            "note": f"moving {names} to {where}",
+        }
+
     def _h_transform_card(self, args: dict) -> dict:
         card = self._card(str(self._req(args, "card_id")))
         command = TransformCard(
@@ -743,15 +777,23 @@ class BattleToolHarness:
         return self._echo(command)
 
     def _choice_cards(self, zone: str) -> list[Card]:
-        match zone:
-            case "hand":
-                cards = self.bundle.card_bundle.hand
-            case "graveyard":
-                cards = self.bundle.card_bundle.graveyard
-            case "deck":
-                cards = self.bundle.card_bundle.deck
-            case _:
-                raise ToolError('"zone" must be hand, graveyard, or deck')
+        if zone not in {"hand", "graveyard", "deck"}:
+            raise ToolError('"zone" must be hand, graveyard, or deck')
+        cards = []
+        all_cards = [
+            *self.bundle.card_bundle.deck,
+            *self.bundle.card_bundle.hand,
+            *self.bundle.card_bundle.graveyard,
+            *self.bundle.card_bundle.resolving,
+        ]
+        for card in all_cards:
+            destination = self._staged_moves.get(card.short_id())
+            if destination is None:
+                current_zone = self.bundle.card_bundle.zone_of(card)
+                if current_zone == zone:
+                    cards.append(card)
+            elif destination == zone or (zone == "deck" and destination == "deck_top"):
+                cards.append(card)
         return [
             card
             for card in cards
@@ -882,6 +924,18 @@ class BattleToolHarness:
                 lines.append(
                     f"- {card.short_id()}: {card.name} - {card.description or ''}"
                 )
+        lines.append("Discard pile:")
+        graveyard = self.bundle.card_bundle.graveyard
+        if graveyard:
+            for card in graveyard[-15:]:
+                lines.append(
+                    f"- {card.short_id()}: {card.name} - {card.description or ''}"
+                )
+            if len(graveyard) > 15:
+                lines.append(f"- and {len(graveyard) - 15} more")
+        else:
+            lines.append("- none")
+        lines.append(f"Deck: {len(self.bundle.card_bundle.deck)} cards")
         rules = self.bundle.formatted_rules()
         if rules:
             lines.append("Rules:")
@@ -927,6 +981,7 @@ class BattleToolHarness:
             self._staged.clear()
             self._consumed_card_ids.clear()
             self._consumed_card_names.clear()
+            self._staged_moves.clear()
             self._queued_effects.clear()
             self._enemy_mode = enemy_mode
             self._default_caster = None if enemy_mode else self.bundle.player

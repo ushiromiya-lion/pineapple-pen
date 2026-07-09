@@ -5,12 +5,16 @@ import uuid
 from base64 import b32encode
 from dataclasses import dataclass, field
 from functools import lru_cache
+from typing import Literal, get_args
 
 from parse import parse
 
 keywords = re.compile(
     r"\b(?:noun|verb|adjective|adverb|pronoun|preposition|conjunction|interjection|article|determiner|auxiliary verb|modal verb|particle|gerund|infinitive|participle)\b"
 )
+
+Zone = Literal["deck_top", "deck", "hand", "graveyard"]
+ZONES: tuple[str, ...] = get_args(Zone)
 
 
 @lru_cache(16)

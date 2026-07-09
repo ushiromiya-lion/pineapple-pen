@@ -656,6 +656,127 @@ def test_interrupt_turn_does_not_consume_error_budget():
     assert harness.session.status == LoopStatus.DONE
 
 
+def test_move_cards_then_reference_same_card_again():
+    bundle = make_bundle()
+    card = bundle.card_bundle.hand[0]
+    harness = BattleToolHarness(
+        bundle,
+        generate_fn=scripted(
+            [
+                model_turn(
+                    fc_part(
+                        "move_cards",
+                        {"card_ids": [card.short_id()], "to": "graveyard"},
+                    ),
+                    fc_part(
+                        "transform_card",
+                        {
+                            "card_id": card.short_id(),
+                            "name": "Returned Spark",
+                            "description": "Deal 1 damage.",
+                        },
+                    ),
+                    fc_part("finish_resolution", {"reason": "moved", "significance": 1}),
+                )
+            ]
+        ),
+    )
+
+    harness.resolve("resolve", enemy_mode=False)
+
+    assert card in bundle.card_bundle.graveyard
+    assert card.name == "Returned Spark"
+
+
+def test_move_cards_updates_picker_options_for_staged_destinations():
+    bundle = make_bundle()
+    moved_out = bundle.card_bundle.hand[0]
+    moved_in = bundle.card_bundle.hand[1]
+    bundle.card_bundle.hand.remove(moved_in)
+    bundle.card_bundle.graveyard.append(moved_in)
+    harness = BattleToolHarness(
+        bundle,
+        generate_fn=scripted(
+            [
+                model_turn(
+                    fc_part(
+                        "move_cards",
+                        {"card_ids": [moved_out.short_id()], "to": "graveyard"},
+                    ),
+                    fc_part(
+                        "move_cards",
+                        {"card_ids": [moved_in.short_id()], "to": "hand"},
+                    ),
+                    fc_part(
+                        "ask_player_choose_cards",
+                        {
+                            "prompt": "Choose a hand card.",
+                            "zone": "hand",
+                            "min_count": 0,
+                            "max_count": 1,
+                        },
+                    ),
+                ),
+                model_turn(
+                    fc_part("finish_resolution", {"reason": "done", "significance": 1})
+                ),
+            ]
+        ),
+    )
+    thread = threading.Thread(target=lambda: harness.resolve("resolve", enemy_mode=False))
+    thread.start()
+
+    request = wait_for_choice(harness)
+    assert isinstance(request, ChooseCardsRequest)
+    option_ids = {card.short_id() for card in request.cards}
+    assert moved_out.short_id() not in option_ids
+    assert moved_in.short_id() in option_ids
+    harness.submit_choice({"card_ids": []})
+    thread.join(timeout=2)
+
+    assert not thread.is_alive()
+
+
+def test_move_cards_snapshot_shows_discard_and_deck_count():
+    bundle = make_bundle()
+    card = bundle.card_bundle.hand.pop()
+    bundle.card_bundle.graveyard.append(card)
+    harness = BattleToolHarness(bundle, generate_fn=scripted([]))
+
+    snapshot = harness._snapshot()
+
+    assert "Discard pile:" in snapshot
+    assert f"- {card.short_id()}: {card.name}" in snapshot
+    assert f"Deck: {len(bundle.card_bundle.deck)} cards" in snapshot
+
+
+def test_move_cards_log_line_and_commit_order_with_draw():
+    bundle = make_bundle()
+    card = bundle.card_bundle.hand.pop()
+    bundle.card_bundle.graveyard.append(card)
+    harness = BattleToolHarness(
+        bundle,
+        generate_fn=scripted(
+            [
+                model_turn(
+                    fc_part(
+                        "move_cards",
+                        {"card_ids": [card.short_id()], "to": "deck_top"},
+                    ),
+                    fc_part("draw_cards", {"count": 1}),
+                    fc_part("finish_resolution", {"reason": "topdeck", "significance": 1}),
+                )
+            ]
+        ),
+    )
+
+    resolved, _ = harness.resolve("resolve", enemy_mode=False)
+    logs = bundle._transform_to_battle_logs(resolved)
+
+    assert card in bundle.card_bundle.hand
+    assert any(f"Move {card.name} to deck_top" in log for log in logs)
+
+
 def test_resolve_enemy_actions_uses_harness():
     bundle = make_bundle()
     enemy = bundle.enemies[0]

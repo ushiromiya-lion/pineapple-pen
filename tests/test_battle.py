@@ -15,6 +15,15 @@ from genio.card import Card
 from genio.effect import SinglePointEffect
 
 
+def empty_card_bundle() -> CardBundle:
+    card_bundle = CardBundle([Card("Seed")])
+    card_bundle.deck = []
+    card_bundle.hand = []
+    card_bundle.graveyard = []
+    card_bundle.resolving = []
+    return card_bundle
+
+
 @pytest.fixture
 def card_bundle():
     return CardBundle.from_predef("initial_deck")
@@ -100,6 +109,56 @@ def test_card_bundle_reverts_temporary_transforms():
 
     assert drawn.name == "Strike"
     assert drawn.description == "Deal 6 damage."
+
+
+def test_card_bundle_remove_from_zones_and_move_cards():
+    deck_card = Card("Deck")
+    hand_card = Card("Hand")
+    grave_card = Card("Grave")
+    resolving_card = Card("Resolving")
+    card_bundle = empty_card_bundle()
+    card_bundle.deck = [deck_card]
+    card_bundle.hand = [hand_card]
+    card_bundle.graveyard = [grave_card]
+    card_bundle.resolving = [resolving_card]
+
+    assert card_bundle.remove_from_zones(deck_card) == "deck"
+    assert deck_card not in card_bundle.deck
+
+    card_bundle.move_cards([grave_card], "hand")
+    assert grave_card in card_bundle.hand
+    assert grave_card not in card_bundle.graveyard
+
+    card_bundle.move_cards([hand_card], "deck_top")
+    assert card_bundle.deck[-1] is hand_card
+    assert hand_card not in card_bundle.hand
+
+    card_bundle.move_cards([resolving_card], "hand")
+    assert resolving_card in card_bundle.hand
+    assert resolving_card not in card_bundle.resolving
+
+
+def test_move_cards_same_zone_noop_and_missing_card_error():
+    card = Card("Stay")
+    card_bundle = empty_card_bundle()
+    card_bundle.hand = [card]
+
+    card_bundle.move_cards([card], "hand")
+
+    assert card_bundle.hand == [card]
+    with pytest.raises(ValueError):
+        card_bundle.remove_from_zones(Card("Missing"))
+
+
+def test_move_cards_to_deck_membership():
+    card = Card("Tuck")
+    card_bundle = empty_card_bundle()
+    card_bundle.hand = [card]
+
+    card_bundle.move_cards([card], "deck")
+
+    assert card in card_bundle.deck
+    assert card not in card_bundle.hand
 
 
 def test_prefix_card_randomizes_on_each_draw():

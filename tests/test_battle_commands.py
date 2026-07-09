@@ -17,6 +17,7 @@ from genio.battle_commands import (
     GainBlock,
     Heal,
     LoseBlock,
+    MoveCards,
     RemoveStatus,
     TransformCard,
     command_from_effect,
@@ -27,6 +28,7 @@ from genio.effect import (
     CreateCardEffect,
     DiscardCardsEffect,
     ModifyAmount,
+    MoveCardsEffect,
     OnDamageTaken,
     SinglePointEffect,
     StatusDefinition,
@@ -64,6 +66,14 @@ def test_command_from_global_effect_create_and_discard():
         name="shiv", description="Deal 1 damage.", copies=2
     )
     assert command_from_effect(DiscardCardsEffect(count=1)) == DiscardCards(count=1)
+
+
+def test_command_from_global_effect_move_cards():
+    card = Card("Headbutt Target")
+
+    assert command_from_effect(MoveCardsEffect(cards=[card], where="deck_top")) == MoveCards(
+        card_ids=(card.short_id(),), where="deck_top"
+    )
 
 
 def test_apply_targeted_commands():
@@ -137,6 +147,16 @@ def test_apply_card_zone_commands():
 
     bundle.apply_commands([DestroyCard(card_ids=(shiv.short_id(),))])
     assert bundle.card_bundle.has_card("knife") is None
+
+
+def test_apply_move_cards_command():
+    bundle = make_bundle()
+    card = bundle.card_bundle.hand[0]
+
+    bundle.apply_commands([MoveCards(card_ids=(card.short_id(),), where="deck_top")])
+
+    assert card not in bundle.card_bundle.hand
+    assert bundle.card_bundle.deck[-1] is card
 
 
 def test_apply_destroy_rule_command():

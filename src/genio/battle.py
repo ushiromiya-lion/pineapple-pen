@@ -33,7 +33,7 @@ from genio.battle_commands import (
     commands_from_effect,
     effect_from_command,
 )
-from genio.card import Card
+from genio.card import Card, Zone
 from genio.components import CanAddAnim
 from genio.core.base import access, promptly
 from genio.effect import (
@@ -49,6 +49,7 @@ from genio.effect import (
     GlobalEffect,
     HealSelf,
     ModifyAmount,
+    MoveCardsEffect,
     OnBlockGained,
     OnDamageDealt,
     OnDamageTaken,
@@ -579,6 +580,38 @@ class CardBundle:
         self.graveyard.extend(self.resolving)
         self.resolving = []
         self.events.append("resolving_to_graveyard")
+
+    def remove_from_zones(self, card: Card) -> str:
+        for zone_name in ("deck", "hand", "graveyard", "resolving"):
+            zone = getattr(self, zone_name)
+            for existing in zone:
+                if existing.id == card.id:
+                    zone.remove(existing)
+                    return zone_name
+        raise ValueError(f"Card {card.short_id()} is not in any zone")
+
+    def zone_of(self, card: Card) -> str:
+        for zone_name in ("deck", "hand", "graveyard", "resolving"):
+            if any(existing.id == card.id for existing in getattr(self, zone_name)):
+                return zone_name
+        raise ValueError(f"Card {card.short_id()} is not in any zone")
+
+    def move_cards(self, cards: list[Card], where: Zone) -> None:
+        for card in cards:
+            source = self.zone_of(card)
+            if source == where:
+                continue
+            self.remove_from_zones(card)
+            match where:
+                case "deck_top":
+                    self.add_into_deck_top(card)
+                case "deck":
+                    self.shuffle_into_deck(card)
+                case "hand":
+                    self.add_to_hand(card)
+                case "graveyard":
+                    self.add_to_graveyard(card)
+        self.events.append("move_cards", cards, where)
 
     def add_to_hand(self, card: Card | list[Card]) -> None:
         if isinstance(card, Sequence):
@@ -1234,6 +1267,10 @@ class BattleBundle:
                             append_log(
                                 f"Duplicate {duplicate.copies} {duplicate.card.name}"
                             )
+                        case MoveCardsEffect(_) as move:
+                            append_log(
+                                f"Move {humanize_cards(move.cards)} to {move.where}"
+                            )
                         case TransformCardEffect(_) as transform:
                             append_log(
                                 f"Transform {transform.from_card.name} to {transform.to_card.name}"
@@ -1337,6 +1374,8 @@ class BattleBundle:
                         self.card_bundle.add_to_hand(cards)
                     case "graveyard":
                         self.card_bundle.add_to_graveyard(cards)
+            case MoveCardsEffect(_) as move:
+                self.card_bundle.move_cards(move.cards, move.where)
             case TransformCardEffect(_) as transform:
                 self.card_bundle.transform_card(transform.from_card, transform.to_card)
             case DestroyCardEffect(_) as destroy:

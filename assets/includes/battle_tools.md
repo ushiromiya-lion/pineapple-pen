@@ -35,6 +35,9 @@ Rules:
   you receive the result. Never guess card ids.
 - R14. Give each ask a short reason narrating why the choice is happening, in
   the battle's tone.
+- R15. To relocate an existing card (return from discard, put on top of deck,
+  tuck into deck), use move_cards. Never create_card a copy for relocation, and
+  never destroy_card plus create_card; those change card identity.
 
 Example:
 
